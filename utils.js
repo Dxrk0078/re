@@ -53,17 +53,18 @@ function setupAutoLogin(bot, username) {
   });
 
   bot.on('message', async (jsonMsg) => {
-    const msg = jsonMsg.toString().toLowerCase();
-    if (msg.includes('please login') || msg.includes('use /login') ||
-        msg.includes('not logged') || msg.includes('login first')) {
-      await sleep(300);
+    // Strip color codes before matching
+    const raw = jsonMsg.toString();
+    const msg = raw.replace(/§[0-9a-fk-or]/gi, '').toLowerCase();
+    emit(username, 'chat', '[SERVER] ' + msg.slice(0, 100));
+    if (msg.includes('login') || msg.includes('authenticate') || msg.includes('auth')) {
+      emit(username, 'info', 'Auth message detected — sending /login...');
       bot.chat(`/login ${PASSWORD}`);
     }
-    if (msg.includes('please register') || msg.includes('use /register') ||
-        msg.includes('not registered')) {
-      await sleep(300);
+    if (msg.includes('register')) {
+      emit(username, 'info', 'Register message detected — sending /register...');
       bot.chat(`/register ${PASSWORD} ${PASSWORD}`);
-      await sleep(500);
+      await sleep(300);
       bot.chat(`/login ${PASSWORD}`);
     }
   });
