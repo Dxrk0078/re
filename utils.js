@@ -52,20 +52,30 @@ function setupAutoLogin(bot, username) {
     }
   });
 
+  let loggedIn = false;
   bot.on('message', async (jsonMsg) => {
-    // Strip color codes before matching
     const raw = jsonMsg.toString();
     const msg = raw.replace(/§[0-9a-fk-or]/gi, '').toLowerCase();
     emit(username, 'chat', '[SERVER] ' + msg.slice(0, 100));
-    if (msg.includes('login') || msg.includes('authenticate') || msg.includes('auth')) {
+    // Only react to auth prompts, ignore error messages containing these words
+    if (msg.includes('unknown or incomplete')) return;
+    if (msg.includes('error')) return;
+    if (!loggedIn && (msg.includes('please') && msg.includes('login'))) {
       emit(username, 'info', 'Auth message detected — sending /login...');
       bot.chat(`/login ${PASSWORD}`);
     }
-    if (msg.includes('register')) {
-      emit(username, 'info', 'Register message detected — sending /register...');
+    if (!loggedIn && (msg.includes('please') && msg.includes('register'))) {
+      emit(username, 'info', 'Register prompt — sending /register...');
       bot.chat(`/register ${PASSWORD} ${PASSWORD}`);
       await sleep(300);
       bot.chat(`/login ${PASSWORD}`);
+    }
+    // Detect successful login
+    if (msg.includes('logged in') || msg.includes('authenticated') || 
+        msg.includes('welcome') || msg.includes('successfully')) {
+      loggedIn = true;
+      emit(username, 'info', 'Login confirmed!');
+      botEvents.emit('loggedIn', { username });
     }
   });
 }
