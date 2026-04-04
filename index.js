@@ -692,7 +692,7 @@ setInterval(()=>{
 
 // ── Skin URL ───────────────────────────────────────────────────────────────
 // Generate a deterministic color from the bot name (no external dependency)
-function nameColor(name){let h=0;for(let i=0;i<name.length;i++)h=(Math.imul(31,h)+name.charCodeAt(i))|0;const hue=Math.abs(h)%360;return`hsl(${hue},60%,55%)`;}
+function nameColor(name){var h=0;for(var i=0;i<name.length;i++)h=(Math.imul(31,h)+name.charCodeAt(i))|0;var hue=Math.abs(h)%360;return'hsl('+hue+',60%,55%)';}
 function skinSvg(name){var c=nameColor(name),l=name.slice(0,2).toUpperCase();return'data:image/svg+xml,'+encodeURIComponent("<svg xmlns='http://www.w3.org/2000/svg' width='40' height='40' viewBox='0 0 40 40'><rect width='40' height='40' rx='6' fill='"+c+"' opacity='.85'/><text x='50%' y='54%' dominant-baseline='middle' text-anchor='middle' fill='white' font-family='monospace' font-weight='bold' font-size='14'>"+l+"</text></svg>");}
 function skinUrl(name){return skinSvg(name);}
 // Optional: swap above to use mc-heads when network is available:
