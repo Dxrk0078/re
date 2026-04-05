@@ -116,12 +116,13 @@ function setupCoordsTracker(bot, username) {
   });
 }
 
-async function fetchServerInfo() {
+async function fetchServerInfo(host, port) {
+  const h = host || HOST, p = port || MC_PORT;
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve(null), 5000);
     try {
       const mc = require('minecraft-protocol');
-      mc.ping({ host: HOST, port: MC_PORT, closeTimeout: 4000 }, (err, result) => {
+      mc.ping({ host: h, port: p, closeTimeout: 4000 }, (err, result) => {
         clearTimeout(timer);
         if (err) { resolve(null); return; }
         try {
