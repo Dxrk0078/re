@@ -1,7 +1,7 @@
 {
   "name": "minecraft-bots",
-  "version": "2.0.0",
-  "description": "MC-BOTS Control Panel by DXRK — Minecraft AFK + Kill bots dashboard",
+  "version": "3.0.1",
+  "description": "MC-BOTS V3 Control Panel by DXRK",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -13,7 +13,8 @@
     "mineflayer": "^4.20.0",
     "dotenv": "^16.0.0",
     "express": "^4.18.0",
-    "discord.js": "^14.0.0"
+    "discord.js": "^14.15.0",
+    "@discordjs/rest": "^2.3.0"
   },
   "optionalDependencies": {
     "socks": "^2.7.0"

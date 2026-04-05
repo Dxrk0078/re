@@ -29,6 +29,7 @@ let serverInfo = null;
 
 // ─── IP Whitelist ─────────────────────────────────────────────────────────────
 const whitelist = new Set();
+const blacklist  = new Set();
 // Auto-add localhost
 whitelist.add('127.0.0.1');
 whitelist.add('::1');
@@ -36,6 +37,12 @@ whitelist.add('::ffff:127.0.0.1');
 
 function getClientIP(req) {
   return req.ip || req.connection.remoteAddress || '0.0.0.0';
+}
+
+function isBlacklisted(req) {
+  const ip  = getClientIP(req);
+  const raw = ip.replace(/^::ffff:/, '');
+  return blacklist.has(ip) || blacklist.has(raw);
 }
 
 function isWhitelisted(req) {
@@ -48,77 +55,299 @@ function isWhitelisted(req) {
 
 // ─── Discord Bot ──────────────────────────────────────────────────────────────
 let discordClient = null;
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN || '';
-const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID || '';
+const DISCORD_TOKEN      = process.env.DISCORD_TOKEN      || '';
+const DISCORD_GUILD_ID   = process.env.DISCORD_GUILD_ID   || '';
 const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || '';
 
 if (DISCORD_TOKEN) {
   try {
-    const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-    discordClient = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+    const {
+      Client, GatewayIntentBits, EmbedBuilder,
+      ActionRowBuilder, ButtonBuilder, ButtonStyle,
+      SlashCommandBuilder, REST, Routes,
+      Events, InteractionType,
+    } = require('discord.js');
 
-    discordClient.on('ready', () => {
-      console.log(`[Discord] Logged in as ${discordClient.user.tag}`);
+    discordClient = new Client({
+      intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+      ],
     });
 
+    const PURPLE = 0x8b5cf6;
+    const GREEN  = 0x34d399;
+    const RED    = 0xf87171;
+    const YELLOW = 0xfbbf24;
+
+    const mkEmbed = (title, desc, color = PURPLE) =>
+      new EmbedBuilder().setTitle(title).setDescription(desc).setColor(color)
+        .setFooter({ text: 'MC-BOTS • DXRK @2026' }).setTimestamp();
+
+    // ── Helper: paginated bot list buttons ──────────────────────────────────
+    const PAGE_SIZE = 5;
+    function getBotNames() { return Object.keys(botStatus); }
+    function botListRow(page) {
+      const names = getBotNames();
+      const start = page * PAGE_SIZE;
+      const slice = names.slice(start, start + PAGE_SIZE);
+      const row = new ActionRowBuilder();
+      slice.forEach(n => {
+        const short = n.slice(0, 10);
+        const online = botStatus[n]?.online;
+        row.addComponents(
+          new ButtonBuilder()
+            .setCustomId(`bot_sel:${n}`)
+            .setLabel(`${online ? '🟢' : '🔴'} ${short}`)
+            .setStyle(ButtonStyle.Secondary)
+        );
+      });
+      if (start + PAGE_SIZE < names.length) {
+        row.addComponents(
+          new ButtonBuilder()
+            .setCustomId(`bot_page:${page + 1}`)
+            .setLabel('Next ▶')
+            .setStyle(ButtonStyle.Primary)
+        );
+      }
+      if (page > 0) {
+        row.addComponents(
+          new ButtonBuilder()
+            .setCustomId(`bot_page:${page - 1}`)
+            .setLabel('◀ Prev')
+            .setStyle(ButtonStyle.Primary)
+        );
+      }
+      return row;
+    }
+
+    function botActionRow(name) {
+      const s = botStatus[name] || {};
+      return new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`bot_start:${name}`).setLabel('▶ Start').setStyle(ButtonStyle.Success).setDisabled(!!s.running),
+        new ButtonBuilder().setCustomId(`bot_stop:${name}`).setLabel('■ Stop').setStyle(ButtonStyle.Danger).setDisabled(!s.running),
+        new ButtonBuilder().setCustomId(`bot_inv:${name}`).setLabel('🎒 Inv').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`bot_coords:${name}`).setLabel('📍 Coords').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`bot_back`).setLabel('◀ Back').setStyle(ButtonStyle.Primary),
+      );
+    }
+
+    function botEmbed(name) {
+      const s  = botStatus[name] || {};
+      const st = stats[name] || {};
+      const cr = coords[name];
+      const inv = st.inventory || {};
+      const invStr = Object.keys(inv).length
+        ? Object.entries(inv).map(([k,v]) => `**${v}x** ${k.replace(/_/g,' ')}`).join('\n')
+        : 'empty';
+      const onlineFor = s.online && s.onlineSince
+        ? (() => { const sec = Math.floor((Date.now()-s.onlineSince)/1000); return sec<60?sec+'s':sec<3600?Math.floor(sec/60)+'m':Math.floor(sec/3600)+'h '+Math.floor((sec%3600)/60)+'m'; })()
+        : '--';
+      return mkEmbed(
+        `${s.online ? '🟢' : '🔴'} ${name}`,
+        [
+          `**Status:** ${s.online ? `ONLINE (${onlineFor})` : 'OFFLINE'}`,
+          `**Running:** ${s.running ? 'Yes' : 'No'}`,
+          `**Type:** ${s.type || 'Bot'}${(botConfigs[name] && botConfigs[name].tag) ? ' ['+botConfigs[name].tag+']' : ''}`,
+          `**Kills:** ${st.ghastKills || 0} | **Food:** ${st.foodAte || 0}`,
+          cr ? `**Coords:** X:${cr.x} Y:${cr.y} Z:${cr.z}` : '**Coords:** unknown',
+          `\n**Inventory:**\n${invStr}`,
+        ].join('\n'),
+        s.online ? GREEN : RED,
+      );
+    }
+
+    // ── Slash commands register ──────────────────────────────────────────────
+    const slashCmds = [
+      new SlashCommandBuilder().setName('bots').setDescription('Show bot list and controls'),
+      new SlashCommandBuilder().setName('status').setDescription('Quick status of all bots'),
+      new SlashCommandBuilder().setName('uptime').setDescription('Server uptime'),
+      new SlashCommandBuilder()
+        .setName('whitelist')
+        .setDescription('Manage dashboard whitelist')
+        .addSubcommand(s => s.setName('add').setDescription('Add IP').addStringOption(o => o.setName('ip').setDescription('IP address').setRequired(true)))
+        .addSubcommand(s => s.setName('remove').setDescription('Remove IP').addStringOption(o => o.setName('ip').setDescription('IP address').setRequired(true)))
+        .addSubcommand(s => s.setName('list').setDescription('List whitelisted IPs'))
+        .addSubcommand(s => s.setName('clear').setDescription('Clear all IPs')),
+      new SlashCommandBuilder()
+        .setName('blacklist')
+        .setDescription('Manage dashboard blacklist')
+        .addSubcommand(s => s.setName('add').setDescription('Block IP').addStringOption(o => o.setName('ip').setDescription('IP address').setRequired(true)))
+        .addSubcommand(s => s.setName('remove').setDescription('Unblock IP').addStringOption(o => o.setName('ip').setDescription('IP address').setRequired(true)))
+        .addSubcommand(s => s.setName('list').setDescription('List blocked IPs')),
+      new SlashCommandBuilder()
+        .setName('bot')
+        .setDescription('Control a specific bot')
+        .addStringOption(o => o.setName('name').setDescription('Bot name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('action').setDescription('Action').setRequired(true)
+          .addChoices(
+            { name: '▶ Start', value: 'start' },
+            { name: '■ Stop',  value: 'stop'  },
+            { name: '📍 Coords', value: 'coords' },
+            { name: '🎒 Inventory', value: 'inv' },
+          )),
+    ].map(cmd => cmd.toJSON());
+
+    discordClient.on(Events.ClientReady, async () => {
+      console.log(`[Discord] Logged in as ${discordClient.user.tag}`);
+      try {
+        const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+        if (DISCORD_GUILD_ID) {
+          await rest.put(Routes.applicationGuildCommands(discordClient.user.id, DISCORD_GUILD_ID), { body: slashCmds });
+        } else {
+          await rest.put(Routes.applicationCommands(discordClient.user.id), { body: slashCmds });
+        }
+        console.log('[Discord] Slash commands registered');
+      } catch(e) { console.error('[Discord] Slash register failed:', e.message); }
+    });
+
+    // ── Autocomplete ──────────────────────────────────────────────────────────
+    discordClient.on(Events.InteractionCreate, async interaction => {
+      if (interaction.type === InteractionType.ApplicationCommandAutocomplete) {
+        const focused = interaction.options.getFocused();
+        const choices = Object.keys(botStatus)
+          .filter(n => n.toLowerCase().includes(focused.toLowerCase()))
+          .slice(0, 25)
+          .map(n => ({ name: `${botStatus[n]?.online ? '🟢' : '🔴'} ${n}`, value: n }));
+        return interaction.respond(choices).catch(() => {});
+      }
+
+      // ── Slash command handling ─────────────────────────────────────────────
+      if (interaction.isChatInputCommand()) {
+        const name = interaction.commandName;
+
+        if (name === 'bots') {
+          const names = getBotNames();
+          if (!names.length) return interaction.reply({ content: 'No bots configured.', ephemeral: true });
+          const embed = mkEmbed('🤖 Bot Panel', 'Select a bot to view controls:');
+          return interaction.reply({ embeds: [embed], components: [botListRow(0)], ephemeral: true });
+        }
+
+        if (name === 'status') {
+          const desc = getBotNames().map(n => {
+            const s = botStatus[n] || {};
+            const dur = s.online && s.onlineSince ? (() => { const sec=Math.floor((Date.now()-s.onlineSince)/1000); return sec<60?sec+'s':sec<3600?Math.floor(sec/60)+'m':Math.floor(sec/3600)+'h'; })() : null;
+            return `${s.online ? '🟢' : '🔴'} **${n}** — ${s.online ? `ONLINE${dur ? ' ('+dur+')' : ''}` : 'OFFLINE'} | ${s.running ? 'running' : 'stopped'}`;
+          }).join('\n') || 'No bots';
+          return interaction.reply({ embeds: [mkEmbed('⚡ Bot Status', desc)] });
+        }
+
+        if (name === 'uptime') {
+          const sec = Math.floor((Date.now() - SERVER_START) / 1000);
+          const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s2 = sec%60;
+          return interaction.reply({ embeds: [mkEmbed('⏱ Uptime', `\`${h}h ${m}m ${s2}s\``, PURPLE)] });
+        }
+
+        if (name === 'whitelist') {
+          const sub = interaction.options.getSubcommand();
+          const ip  = interaction.options.getString('ip');
+          if (sub === 'add') { whitelist.add(ip); return interaction.reply({ embeds: [mkEmbed('✅ Whitelisted', `\`${ip}\` added.`, GREEN)] }); }
+          if (sub === 'remove') { whitelist.delete(ip); return interaction.reply({ embeds: [mkEmbed('🔴 Removed', `\`${ip}\` removed.`, RED)] }); }
+          if (sub === 'list') { return interaction.reply({ embeds: [mkEmbed('📋 Whitelist', `\`\`\`\n${[...whitelist].join('\n') || 'None'}\n\`\`\``)] }); }
+          if (sub === 'clear') { whitelist.clear(); whitelist.add('127.0.0.1'); whitelist.add('::1'); return interaction.reply({ embeds: [mkEmbed('🗑️ Cleared', 'Whitelist cleared.', YELLOW)] }); }
+        }
+
+        if (name === 'blacklist') {
+          const sub = interaction.options.getSubcommand();
+          const ip  = interaction.options.getString('ip');
+          if (sub === 'add') { blacklist.add(ip); whitelist.delete(ip); return interaction.reply({ embeds: [mkEmbed('🚫 Blacklisted', `\`${ip}\` blocked.`, RED)] }); }
+          if (sub === 'remove') { blacklist.delete(ip); return interaction.reply({ embeds: [mkEmbed('✅ Unblocked', `\`${ip}\` unblocked.`, GREEN)] }); }
+          if (sub === 'list') { return interaction.reply({ embeds: [mkEmbed('🚫 Blacklist', `\`\`\`\n${[...blacklist].join('\n') || 'None'}\n\`\`\``)] }); }
+        }
+
+        if (name === 'bot') {
+          const bName  = interaction.options.getString('name');
+          const action = interaction.options.getString('action');
+          if (!botStatus[bName]) return interaction.reply({ content: `Bot \`${bName}\` not found.`, ephemeral: true });
+          if (action === 'start') {
+            if (!botStatus[bName].running || !controllers[bName]) { botStatus[bName].running = true; launchBot(bName); broadcast('control', { username: bName, action: 'started', running: true }); }
+            return interaction.reply({ embeds: [botEmbed(bName)], components: [botActionRow(bName)], ephemeral: true });
+          }
+          if (action === 'stop') {
+            botStatus[bName].running = false; botStatus[bName].online = false;
+            if (controllers[bName]) { try { controllers[bName].stop(); } catch(_){} delete controllers[bName]; }
+            broadcast('control', { username: bName, action: 'stopped', running: false });
+            broadcast('status',  { username: bName, online: false });
+            return interaction.reply({ embeds: [botEmbed(bName)], components: [botActionRow(bName)], ephemeral: true });
+          }
+          if (action === 'inv') {
+            const inv = stats[bName]?.inventory || {};
+            const invStr = Object.keys(inv).length ? Object.entries(inv).map(([k,v]) => `**${v}x** ${k.replace(/_/g,' ')}`).join('\n') : 'No tracked items';
+            return interaction.reply({ embeds: [mkEmbed(`🎒 ${bName} Inventory`, invStr)], ephemeral: true });
+          }
+          if (action === 'coords') {
+            const bot = botRegistry[bName];
+            if (bot?.entity) { const p = bot.entity.position; coords[bName] = { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z), ts: Date.now() }; broadcast('coords', { username: bName, coords: coords[bName] }); }
+            const cr = coords[bName];
+            return interaction.reply({ embeds: [mkEmbed(`📍 ${bName} Coords`, cr ? `X:${cr.x} Y:${cr.y} Z:${cr.z}` : 'Unknown')], ephemeral: true });
+          }
+        }
+      }
+
+      // ── Button handling ───────────────────────────────────────────────────
+      if (interaction.isButton()) {
+        const [type, ...rest] = interaction.customId.split(':');
+        const val = rest.join(':');
+
+        if (type === 'bot_page') {
+          const page = parseInt(val) || 0;
+          return interaction.update({ components: [botListRow(page)] });
+        }
+        if (type === 'bot_sel') {
+          return interaction.update({ embeds: [botEmbed(val)], components: [botActionRow(val)] });
+        }
+        if (type === 'bot_back') {
+          return interaction.update({ embeds: [mkEmbed('🤖 Bot Panel', 'Select a bot:')], components: [botListRow(0)] });
+        }
+        if (type === 'bot_start') {
+          if (!botStatus[val].running || !controllers[val]) { botStatus[val].running = true; launchBot(val); broadcast('control', { username: val, action: 'started', running: true }); }
+          return interaction.update({ embeds: [botEmbed(val)], components: [botActionRow(val)] });
+        }
+        if (type === 'bot_stop') {
+          botStatus[val].running = false; botStatus[val].online = false;
+          if (controllers[val]) { try { controllers[val].stop(); } catch(_){} delete controllers[val]; }
+          broadcast('control', { username: val, action: 'stopped', running: false });
+          broadcast('status', { username: val, online: false });
+          return interaction.update({ embeds: [botEmbed(val)], components: [botActionRow(val)] });
+        }
+        if (type === 'bot_inv') {
+          const inv = stats[val]?.inventory || {};
+          const invStr = Object.keys(inv).length ? Object.entries(inv).map(([k,v]) => `**${v}x** ${k.replace(/_/g,' ')}`).join('\n') : 'No tracked items';
+          return interaction.reply({ embeds: [mkEmbed(`🎒 ${val} Inventory`, invStr)], ephemeral: true });
+        }
+        if (type === 'bot_coords') {
+          const bot2 = botRegistry[val];
+          if (bot2?.entity) { const p = bot2.entity.position; coords[val] = { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z), ts: Date.now() }; broadcast('coords', { username: val, coords: coords[val] }); }
+          const cr2 = coords[val];
+          return interaction.reply({ embeds: [mkEmbed(`📍 ${val} Coords`, cr2 ? `X:${cr2.x} Y:${cr2.y} Z:${cr2.z}` : 'Unknown')], ephemeral: true });
+        }
+      }
+    });
+
+    // ── Legacy ! prefix commands (kept for compatibility) ─────────────────
     discordClient.on('messageCreate', async (msg) => {
       if (msg.author.bot) return;
       if (!msg.content.startsWith('!')) return;
       if (DISCORD_GUILD_ID && msg.guild?.id !== DISCORD_GUILD_ID) return;
-
       const args = msg.content.slice(1).trim().split(/\s+/);
       const cmd = args[0]?.toLowerCase();
-
       const reply = (embed) => msg.reply({ embeds: [embed] });
-      const makeEmbed = (title, desc, color) =>
-        new EmbedBuilder().setTitle(title).setDescription(desc).setColor(color)
-          .setFooter({ text: 'MC-BOTS • DXRK @2026' }).setTimestamp();
-
-      if (cmd === 'whitelist') {
-        const sub = args[1]?.toLowerCase();
-        const ip  = args[2];
-
-        if (sub === 'add' && ip) {
-          whitelist.add(ip);
-          await reply(makeEmbed('✅ IP Whitelisted', `\`${ip}\` has been added to the whitelist.\nThey can now fully access the dashboard.`, 0x34d399));
-        } else if (sub === 'remove' && ip) {
-          whitelist.delete(ip);
-          await reply(makeEmbed('🔴 IP Removed', `\`${ip}\` has been removed from the whitelist.`, 0xf87171));
-        } else if (sub === 'list') {
-          const list = [...whitelist].join('\n') || 'None';
-          await reply(makeEmbed('📋 Whitelist', `\`\`\`\n${list}\n\`\`\``, 0x8b5cf6));
-        } else if (sub === 'clear') {
-          whitelist.clear();
-          whitelist.add('127.0.0.1'); whitelist.add('::1');
-          await reply(makeEmbed('🗑️ Cleared', 'Whitelist cleared. Only localhost remains.', 0xfbbf24));
-        } else {
-          await reply(makeEmbed('📖 Whitelist Help', [
-            '`!whitelist add <ip>` — Add IP to whitelist',
-            '`!whitelist remove <ip>` — Remove IP',
-            '`!whitelist list` — Show all whitelisted IPs',
-            '`!whitelist clear` — Clear all IPs',
-          ].join('\n'), 0xa78bfa));
-        }
-      } else if (cmd === 'status') {
-        const bots = Object.keys(botStatus).map(n =>
-          `${botStatus[n]?.online ? '🟢' : '🔴'} **${n}** — ${botStatus[n]?.online ? 'ONLINE' : 'OFFLINE'}`
-        ).join('\n') || 'No bots';
-        await reply(makeEmbed('⚡ Bot Status', bots, 0x8b5cf6));
-      } else if (cmd === 'help') {
-        await reply(makeEmbed('🤖 MC-BOTS Commands', [
-          '`!whitelist add <ip>` — Whitelist an IP address',
-          '`!whitelist remove <ip>` — Remove from whitelist',
-          '`!whitelist list` — List whitelisted IPs',
-          '`!whitelist clear` — Clear whitelist',
-          '`!status` — View bot statuses',
-          '`!help` — Show this message',
-        ].join('\n'), 0x8b5cf6));
+      if (cmd === 'help') {
+        await reply(mkEmbed('🤖 MC-BOTS Commands', [
+          '`/bots` — Bot panel with buttons',
+          '`/status` — All bot statuses',
+          '`/bot <name> <action>` — Control bot',
+          '`/whitelist <add|remove|list|clear>`',
+          '`/blacklist <add|remove|list>`',
+          '`/uptime` — Server uptime',
+        ].join('\n')));
       }
     });
 
     discordClient.login(DISCORD_TOKEN).catch(e => console.error('[Discord] Login failed:', e.message));
   } catch (e) {
-    console.warn('[Discord] discord.js not installed, skipping bot:', e.message);
+    console.warn('[Discord] discord.js not installed, skipping:', e.message);
   }
 }
 
@@ -183,6 +412,11 @@ botEvents.on('coords', ({ username, coords: c }) => {
 const sseClients = new Set();
 function broadcast(event, data) {
   sseClients.forEach(res => res.write('event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n'));
+  // Also push non-log events to poll queue for polling clients
+  if (event !== 'log') {
+    eventQueue.push({ id: ++eventId, event, data });
+    if (eventQueue.length > 500) eventQueue.shift();
+  }
 }
 
 // SSE — only whitelisted IPs can subscribe
@@ -215,6 +449,16 @@ app.get('/health', (req, res) => {
 });
 
 // ─── Auth check ───────────────────────────────────────────────────────────────
+// ─── Auto-whitelist helper: show current IP so you can add it from Discord ────
+app.get('/myip', (req, res) => {
+  const ip = getClientIP(req);
+  res.send(`<html><body style="background:#050210;color:#e8deff;font-family:monospace;padding:40px;text-align:center">
+    <h2 style="color:#8b5cf6">Your IP Address</h2>
+    <p style="font-size:24px;margin:20px 0;color:#c4b5fd">${ip}</p>
+    <p style="color:#7a6699;font-size:13px">Use <code>/whitelist add ${ip}</code> in Discord to gain access</p>
+  </body></html>`);
+});
+
 app.get('/api/whoami', (req, res) => {
   const ip = getClientIP(req);
   const authed = isWhitelisted(req);
@@ -263,7 +507,11 @@ function requireAuth(req, res, next) {
 app.post('/bot/:name/start', requireAuth, (req, res) => {
   const name = req.params.name;
   if (!botStatus[name]) return res.json({ ok: false, reason: 'unknown bot' });
-  if (botStatus[name].running) return res.json({ ok: false, reason: 'already running' });
+  // If running and controller exists, just confirm
+  if (botStatus[name].running && controllers[name]) {
+    broadcast('control', { username: name, action: 'started', running: true });
+    return res.json({ ok: true, note: 'already running' });
+  }
   botStatus[name].running = true;
   launchBot(name);
   broadcast('control', { username: name, action: 'started', running: true });
@@ -314,10 +562,13 @@ app.post('/bot/:name/rename', requireAuth, (req, res) => {
   if (!botStatus[oldName]) return res.json({ ok: false, reason: 'unknown bot' });
   if (botStatus[nn] && nn !== oldName) return res.json({ ok: false, reason: 'name already taken' });
   if (controllers[oldName]) { try { controllers[oldName].stop(); } catch(_){} delete controllers[oldName]; }
+  const newTag  = req.body.tag  !== undefined ? req.body.tag  : botConfigs[oldName].tag;
+  const newType = req.body.type !== undefined ? req.body.type : botConfigs[oldName].type;
   botStatus[nn] = { ...botStatus[oldName], running: false, online: false };
   stats[nn] = { ...stats[oldName] };
   coords[nn] = coords[oldName];
-  botConfigs[nn] = { ...botConfigs[oldName], name: nn };
+  botConfigs[nn] = { ...botConfigs[oldName], name: nn, tag: newTag, type: newType };
+  botStatus[nn].type = typeLabel(newType);
   botServers[nn] = { ...(botServers[oldName] || { host: utils.HOST, port: utils.MC_PORT }) };
   containerCache[nn] = { ...(containerCache[oldName] || { items: {}, ts: 0 }) };
   if (nn !== oldName) {
@@ -432,7 +683,33 @@ app.get('/poll', (req, res) => {
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.redirect('/dash'));
-app.get('/dash', (req, res) => res.send(HTML()));
+app.get('/dash', (req, res) => {
+  if (isBlacklisted(req)) return res.send(BLACKLISTED_HTML());
+  res.send(HTML());
+});
+
+function BLACKLISTED_HTML() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Access Denied</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#050210;color:#e8deff;font-family:'JetBrains Mono',monospace;min-height:100vh;display:flex;align-items:center;justify-content:center;overflow:hidden}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at center,rgba(220,38,38,.18) 0%,transparent 70%);pointer-events:none}
+.wrap{text-align:center;padding:40px;max-width:480px;position:relative;z-index:1}
+.icon{font-size:90px;margin-bottom:28px;filter:drop-shadow(0 0 30px rgba(248,113,113,.6));animation:pulse 2.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(.94)}}
+h1{font-size:26px;font-weight:700;color:#f87171;letter-spacing:4px;margin-bottom:14px;text-shadow:0 0 24px rgba(248,113,113,.7)}
+p{color:#6b7280;font-size:12px;letter-spacing:.5px;line-height:1.9}
+.code{font-size:10px;color:#2d1a3a;margin-top:24px;letter-spacing:2px;border-top:1px solid rgba(248,113,113,.1);padding-top:16px}
+</style></head>
+<body><div class="wrap">
+  <div class="icon">🚫</div>
+  <h1>YOU ARE BLACKLISTED</h1>
+  <p>Your access to this control panel has been permanently revoked by the administrator.<br><br>If you believe this is an error, contact the admin via Discord.</p>
+  <div class="code">ERROR 403 · ACCESS DENIED · MC-BOTS NEXUS · DXRK @2026</div>
+</div></body></html>`;
+}
 
 function HTML() { return `<!DOCTYPE html>
 <html lang="en">
@@ -580,10 +857,16 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
 .log-panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);display:flex;flex-direction:column;overflow:hidden;height:310px}
 .log-head{padding:6px 10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:5px;flex-shrink:0;background:rgba(0,0,0,.2);flex-wrap:nowrap;overflow:hidden}
 .log-title{font-family:var(--fd);color:var(--v2);font-weight:700;font-size:12px;letter-spacing:.5px;flex-shrink:0;margin-right:4px}
-.bot-tabs{display:flex;gap:3px;overflow-x:auto;flex:1;min-width:0}
-.bot-tabs::-webkit-scrollbar{display:none}
-.bot-tab{background:none;border:1px solid var(--border);color:var(--dim);font-family:var(--fd);font-size:9px;font-weight:600;letter-spacing:.3px;padding:2px 8px;border-radius:4px;cursor:pointer;transition:all .2s;white-space:nowrap;flex-shrink:0}
-.bot-tab.active{border-color:var(--v);color:var(--v2);background:rgba(139,92,246,.15)}
+.bot-drop-btn{background:rgba(139,92,246,.1);border:1px solid var(--border);color:var(--v2);font-family:var(--fd);font-size:10px;font-weight:700;letter-spacing:.5px;padding:3px 10px;border-radius:5px;cursor:pointer;display:flex;align-items:center;gap:6px;transition:all .2s;white-space:nowrap}
+.bot-drop-btn:hover{border-color:var(--v);background:rgba(139,92,246,.2)}
+.bot-drop-arrow{transition:transform .2s;font-size:10px}
+.bot-drop-arrow.open{transform:rotate(180deg)}
+.bot-drop-menu{display:none;position:absolute;top:calc(100% + 4px);left:0;background:rgba(15,7,42,.98);border:1px solid var(--border);border-radius:8px;min-width:150px;z-index:200;box-shadow:0 8px 32px rgba(0,0,0,.6),var(--glow);overflow:hidden;animation:dropIn .15s ease}
+@keyframes dropIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
+.bot-drop-menu.show{display:block}
+.bot-drop-item{padding:7px 12px;font-family:var(--fd);font-size:11px;font-weight:600;color:var(--dim2);cursor:pointer;transition:all .15s;display:flex;align-items:center;gap:6px}
+.bot-drop-item:hover{background:rgba(139,92,246,.12);color:var(--v2)}
+.bot-drop-item.active{color:var(--v2);background:rgba(139,92,246,.15)}
 .type-filters{display:flex;gap:3px;flex-shrink:0}
 .filter-btn{background:none;border:1px solid var(--border);color:var(--dim);font-family:var(--fd);font-size:9px;font-weight:600;letter-spacing:.5px;padding:1px 6px;border-radius:4px;cursor:pointer;transition:all .2s;flex-shrink:0}
 .filter-btn.active{border-color:var(--v);color:var(--v2);background:rgba(139,92,246,.12)}
@@ -607,13 +890,20 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
 .t-chat .log-tag,.t-chat .log-msg{color:var(--v2)}
 .t-inv .log-tag,.t-inv .log-msg{color:var(--teal)}
 .t-error{background:rgba(248,113,113,.04)}.t-kick{background:rgba(251,146,60,.04)}.t-kill{background:rgba(244,114,182,.04)}
-.log-cmd-bar{display:flex;border-top:1px solid var(--border);flex-shrink:0}
+.log-cmd-bar{display:flex;border-top:1px solid var(--border);flex-shrink:0;position:relative}
+.cmd-suggestions{display:none;position:absolute;bottom:100%;left:0;right:60px;background:rgba(15,7,42,.98);border:1px solid var(--border);border-bottom:none;border-radius:8px 8px 0 0;z-index:50;max-height:200px;overflow-y:auto}
+.cmd-suggestions.show{display:block}
+.cmd-sug-item{padding:6px 10px;font-family:var(--fm);font-size:11px;color:var(--dim2);cursor:pointer;display:flex;align-items:center;gap:8px;transition:background .1s}
+.cmd-sug-item:hover,.cmd-sug-item.focused{background:rgba(139,92,246,.15);color:var(--v2)}
+.cmd-sug-cmd{color:var(--v2);font-weight:600;flex-shrink:0}
+.cmd-sug-desc{color:var(--dim);font-size:10px}
 .cmd-field{flex:1;background:rgba(0,0,0,.4);border:none;color:var(--text);font-family:var(--fm);font-size:11px;padding:7px 10px;outline:none}
 .cmd-field::placeholder{color:var(--dim)}
 .cmd-go{background:var(--green-bg);border:none;border-left:1px solid var(--border);color:var(--green);font-family:var(--fd);font-weight:600;font-size:11px;padding:7px 14px;cursor:pointer;transition:background .2s}
 .cmd-go:hover{background:rgba(6,60,38,.9)}
 /* Modals */
 .overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:100;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
+#rename-overlay,#proxy-overlay,#bsrv-overlay,#inv-overlay{z-index:200}
 .overlay.show{display:flex;animation:fadeIn .15s ease}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 .modal{background:linear-gradient(160deg,rgba(18,8,50,.98),rgba(10,5,30,.98));border:1px solid var(--border2);border-radius:14px;display:flex;flex-direction:column;overflow:hidden;box-shadow:var(--glow2),0 20px 60px rgba(0,0,0,.7);animation:modalIn .2s ease}
@@ -644,6 +934,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
 .detail-field{flex:1;background:rgba(0,0,0,.5);border:none;color:var(--text);font-family:var(--fm);font-size:12px;padding:9px 12px;outline:none}
 .detail-send{background:var(--green-bg);border:none;border-left:1px solid var(--border);color:var(--green);font-family:var(--fd);font-weight:700;padding:9px 16px;cursor:pointer;font-size:12px;letter-spacing:.5px}
 #inv-overlay .modal{width:450px;max-width:95vw}
+#rename-overlay,#proxy-overlay,#bsrv-overlay{z-index:200}
 .inv-body{padding:14px;display:flex;flex-direction:column;gap:10px;max-height:68vh;overflow-y:auto}
 .inv-sec-title{font-family:var(--fd);font-size:10px;font-weight:700;letter-spacing:1.5px;color:var(--dim2);border-bottom:1px solid var(--border);padding-bottom:4px}
 .inv-grid{display:flex;flex-wrap:wrap;gap:5px;margin-top:5px}
@@ -749,7 +1040,15 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
   <div class="log-panel">
     <div class="log-head">
       <span class="log-title">LOG</span>
-      <div class="bot-tabs" id="bot-tabs"></div>
+      <div style="position:relative;flex-shrink:0">
+        <button class="bot-drop-btn" id="bot-drop-btn" onclick="toggleBotDrop()">
+          <span id="bot-drop-label">ALL BOTS</span>
+          <span class="bot-drop-arrow" id="bot-drop-arrow">▾</span>
+        </button>
+        <div class="bot-drop-menu" id="bot-drop-menu">
+          <div class="bot-drop-item active" data-tab="all">ALL BOTS</div>
+        </div>
+      </div>
       <div class="type-filters">
         <button class="filter-btn active" data-lf="all">ALL</button>
         <button class="filter-btn" data-lf="error">ERR</button>
@@ -760,8 +1059,9 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
       <button class="clr-btn" onclick="clearMainLog()">CLR</button>
     </div>
     <div class="log-area" id="main-log"></div>
-    <div class="log-cmd-bar">
-      <input class="cmd-field owner-only-input" id="main-cmd" placeholder="Select a bot tab, then type command...">
+    <div class="log-cmd-bar" style="position:relative">
+      <div class="cmd-suggestions" id="cmd-suggestions"></div>
+      <input class="cmd-field owner-only-input" id="main-cmd" placeholder="Select a bot, then type /cmd or !cmd..." autocomplete="off" oninput="showCmdSuggestions(this.value)" onkeydown="handleCmdKey(event)">
       <button class="cmd-go owner-only" onclick="sendMainCmd()">&#9654;</button>
     </div>
   </div>
@@ -791,8 +1091,9 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
           <button class="clr-btn" onclick="document.getElementById('detail-log').innerHTML=''">CLR</button>
         </div>
         <div class="detail-log" id="detail-log"></div>
-        <div class="detail-cmd">
-          <input class="detail-field owner-only-input" id="detail-cmd-field" placeholder="Type command..." onkeydown="if(event.key==='Enter')sendDetailCmd()">
+        <div class="detail-cmd" style="position:relative">
+          <div class="cmd-suggestions" id="detail-suggestions" style="left:0;right:60px"></div>
+          <input class="detail-field owner-only-input" id="detail-cmd-field" placeholder="Type /cmd or !cmd..." oninput="showDetailSugs(this.value)" onkeydown="handleDetailKey(event)" autocomplete="off">
           <button class="detail-send owner-only" onclick="sendDetailCmd()">SEND</button>
         </div>
       </div>
@@ -854,13 +1155,30 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
 
 <!-- Global Server -->
 <div class="overlay" id="srv-overlay" onclick="if(event.target===this)closeOverlay('srv-overlay')">
-  <div class="modal">
-    <div class="modal-hdr"><span class="modal-title">&#9881; Global Server Config</span><button class="modal-x" onclick="closeOverlay('srv-overlay')">&#10005;</button></div>
+  <div class="modal" style="width:480px;max-width:97vw">
+    <div class="modal-hdr"><span class="modal-title">&#9881; Settings</span><button class="modal-x" onclick="closeOverlay('srv-overlay')">&#10005;</button></div>
     <div class="modal-body">
-      <div class="field-group"><div class="field-label">HOST</div><input class="field-input" id="srv-host-input" placeholder="play.example.net"></div>
+      <div class="field-group"><div class="field-label">SERVER HOST</div><input class="field-input" id="srv-host-input" placeholder="play.example.net"></div>
       <div class="field-group"><div class="field-label">PORT</div><input class="field-input" id="srv-port-input" placeholder="25565" type="number"></div>
-      <div class="srv-note">Default for all bots. Each bot can override via &#127760; button on its card.</div>
+      <div class="srv-note">Default for all bots. Each bot can override its own server.</div>
       <div class="btn-row"><button class="modal-btn" onclick="saveServerConfig()">SAVE</button><button class="modal-btn-sec" onclick="closeOverlay('srv-overlay')">Cancel</button></div>
+      <div style="border-top:1px solid var(--border);margin-top:14px;padding-top:14px">
+        <div class="field-label" style="margin-bottom:8px">WHITELIST</div>
+        <div style="display:flex;gap:6px;margin-bottom:8px">
+          <input class="field-input" id="wl-ip-input" placeholder="IP address to add..." style="flex:1">
+          <button class="modal-btn" style="flex:0 0 auto;padding:8px 14px;font-size:12px" onclick="wlAdd()">ADD</button>
+        </div>
+        <div id="wl-list" style="font-size:11px;max-height:100px;overflow-y:auto"></div>
+      </div>
+      <div style="border-top:1px solid var(--border);margin-top:14px;padding-top:14px">
+        <div class="field-label" style="margin-bottom:8px">BLACKLIST</div>
+        <div style="display:flex;gap:6px;margin-bottom:8px">
+          <input class="field-input" id="bl-ip-input" placeholder="IP address to block..." style="flex:1">
+          <button class="modal-btn" style="flex:0 0 auto;padding:8px 14px;font-size:12px;background:var(--red-bg);border-color:var(--red-bd);color:var(--red)" onclick="blAdd()">BLOCK</button>
+        </div>
+        <div id="bl-list" style="font-size:11px;max-height:100px;overflow-y:auto"></div>
+      </div>
+      <div class="srv-note" style="margin-top:10px">&#128712; Your IP: <span id="my-ip-display" style="color:var(--v3)">loading...</span></div>
     </div>
   </div>
 </div>
@@ -885,11 +1203,23 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
 <!-- Rename -->
 <div class="overlay" id="rename-overlay" onclick="if(event.target===this)closeOverlay('rename-overlay')">
   <div class="modal">
-    <div class="modal-hdr"><span class="modal-title">&#9998; Rename Bot</span><button class="modal-x" onclick="closeOverlay('rename-overlay')">&#10005;</button></div>
+    <div class="modal-hdr"><span class="modal-title">&#9998; Edit Bot</span><button class="modal-x" onclick="closeOverlay('rename-overlay')">&#10005;</button></div>
     <div class="modal-body">
-      <div class="field-group"><div class="field-label">NEW USERNAME</div><input class="field-input" id="rename-input" placeholder="New username..." maxlength="16" onkeydown="if(event.key==='Enter')doRename()"></div>
-      <div class="srv-note">&#9888; Bot will disconnect and reconnect with new name.</div>
-      <div class="btn-row"><button class="modal-btn" onclick="doRename()">RENAME &amp; RECONNECT</button><button class="modal-btn-sec" onclick="closeOverlay('rename-overlay')">Cancel</button></div>
+      <div class="field-group"><div class="field-label">USERNAME</div><input class="field-input" id="rename-input" placeholder="New username..." maxlength="16" onkeydown="if(event.key==='Enter')doRename()"></div>
+      <div class="field-group">
+        <div class="field-label">TAG / LABEL</div>
+        <input class="field-input" id="rename-tag-input" placeholder="e.g. main, backup, ghast farm..." maxlength="20">
+      </div>
+      <div class="field-group">
+        <div class="field-label">BOT TYPE</div>
+        <div class="type-toggle" id="rename-type-toggle">
+          <div class="type-opt kill" id="rt-kill" onclick="selectRenameType('kill')">&#9876; KILL</div>
+          <div class="type-opt afk" id="rt-afk" onclick="selectRenameType('afk')">&#128164; AFK</div>
+          <div class="type-opt custom" id="rt-custom" onclick="selectRenameType('custom')">&#9881; CUSTOM</div>
+        </div>
+      </div>
+      <div class="srv-note">&#9888; Rename will disconnect and reconnect the bot.</div>
+      <div class="btn-row"><button class="modal-btn" onclick="doRename()">SAVE &amp; RECONNECT</button><button class="modal-btn-sec" onclick="closeOverlay('rename-overlay')">Cancel</button></div>
     </div>
   </div>
 </div>
@@ -1028,19 +1358,38 @@ function renderCard(name){
 }
 
 function updateBotTabs(){
-  var t=document.getElementById('bot-tabs');
-  t.innerHTML='<button class="bot-tab'+(mainBotFilter==='all'?' active':'')+'" data-tab="all">ALL</button>';
+  var menu=document.getElementById('bot-drop-menu');
+  menu.innerHTML='<div class="bot-drop-item'+(mainBotFilter==='all'?' active':'')+'" data-tab="all">📋 ALL BOTS</div>';
   Object.keys(status).forEach(function(n){
-    t.innerHTML+='<button class="bot-tab'+(mainBotFilter===n?' active':'')+'" data-tab="'+esc(n)+'">'+esc(n)+'</button>';
+    var s=status[n]||{};
+    menu.innerHTML+='<div class="bot-drop-item'+(mainBotFilter===n?' active':'')+'" data-tab="'+esc(n)+'">'+
+      (s.online?'<span style="color:var(--green)">●</span>':'<span style="color:var(--red)">●</span>')+
+      ' '+esc(n.slice(0,14))+'</div>';
+  });
+  // Re-attach listeners
+  menu.querySelectorAll('[data-tab]').forEach(function(el){
+    el.addEventListener('click',function(){setMainBotFilter(el.dataset.tab);toggleBotDrop(true);});
   });
 }
-document.getElementById('bot-tabs').addEventListener('click',function(ev){
-  var btn=ev.target.closest('[data-tab]');if(!btn)return;
-  setMainBotFilter(btn.dataset.tab);
+function toggleBotDrop(forceClose){
+  var menu=document.getElementById('bot-drop-menu');
+  var arrow=document.getElementById('bot-drop-arrow');
+  if(forceClose||menu.classList.contains('show')){
+    menu.classList.remove('show');arrow.classList.remove('open');
+  }else{
+    menu.classList.add('show');arrow.classList.add('open');
+  }
+}
+// Close dropdown on outside click
+document.addEventListener('click',function(ev){
+  if(!ev.target.closest('#bot-drop-btn')&&!ev.target.closest('#bot-drop-menu'))
+    toggleBotDrop(true);
 });
 function setMainBotFilter(n){
   mainBotFilter=n;updateBotTabs();rebuildMainLog();
-  document.getElementById('main-cmd').placeholder=n==='all'?'Select a bot tab first...':'/cmd \u2192 '+n+'...';
+  var lbl=document.getElementById('bot-drop-label');
+  if(lbl)lbl.textContent=n==='all'?'ALL BOTS':n.slice(0,14);
+  document.getElementById('main-cmd').placeholder=n==='all'?'Select a bot first...':'/cmd \u2192 '+n+'...';
 }
 
 document.addEventListener('click',function(ev){
@@ -1050,13 +1399,83 @@ document.addEventListener('click',function(ev){
   if(df){detailTypeFilter=df.dataset.df;document.querySelectorAll('[data-df]').forEach(function(b){b.classList.toggle('active',b.dataset.df===detailTypeFilter);});rebuildDetailLog();}
 });
 
+// Parse Minecraft JSON kick messages into colored readable text
+function parseMCMsg(raw) {
+  if (!raw) return '';
+  var s = String(raw);
+  // Try to find JSON object in the string
+  var m = s.match(/\{[\s\S]*\}/);
+  if (m) {
+    try {
+      var obj = JSON.parse(m[0]);
+      var result = extractMCObj(obj);
+      if (result) return result;
+    } catch(_) {}
+  }
+  // Strip § color codes
+  return esc(s.replace(/\u00a7[0-9a-fk-or]/gi,''));
+}
+
+function extractMCObj(obj) {
+  if (!obj) return '';
+  // Handle NBT-style compound: {type:"compound", value:{...}}
+  if (obj.type === 'compound' && obj.value) return extractMCObj(obj.value);
+  // Handle extra list
+  if (obj.extra && obj.extra.type === 'list' && obj.extra.value && obj.extra.value.value) {
+    var items = obj.extra.value.value;
+    if (!Array.isArray(items)) items = [items];
+    var parts = obj.text && obj.text.value ? esc(obj.text.value) : '';
+    items.forEach(function(item) {
+      if (!item) return;
+      var color = (item.color && item.color.value) || '';
+      var bold  = (item.bold  && item.bold.value)  || false;
+      var text  = (item.text  && item.text.value)  || (item[''] && item[''].value) || '';
+      if (!text) return;
+      var style = '';
+      if (color) style += 'color:' + mcColor(color) + ';';
+      if (bold)  style += 'font-weight:bold;';
+      parts += '<span style="' + style + '">' + esc(text) + '</span>';
+    });
+    return parts || null;
+  }
+  // Handle simple JSON text {text:"...", extra:[...]}
+  if (typeof obj.text === 'string' || (obj.text && obj.text.value)) {
+    var t2 = typeof obj.text === 'string' ? obj.text : obj.text.value || '';
+    var parts2 = t2 ? esc(t2) : '';
+    var extra = obj.extra || [];
+    if (!Array.isArray(extra)) extra = [extra];
+    extra.forEach(function(e2) {
+      if (!e2) return;
+      var c2 = e2.color || '', b2 = e2.bold || false, tx = e2.text || '';
+      if (!tx) return;
+      var st2 = c2 ? 'color:'+mcColor(c2)+';' : '';
+      if (b2) st2 += 'font-weight:bold;';
+      parts2 += '<span style="'+st2+'">'+esc(tx)+'</span>';
+    });
+    return parts2 || null;
+  }
+  return null;
+}
+
+function mcColor(c) {
+  var map = {black:'#111',dark_blue:'#0066cc',dark_green:'#006600',dark_aqua:'#009999',dark_red:'#cc0000',dark_purple:'#990099',gold:'#ffaa00',gray:'#aaaaaa',dark_gray:'#666666',blue:'#5555ff',green:'#55ff55',aqua:'#55ffff',red:'#ff5555',light_purple:'#ff55ff',yellow:'#ffff55',white:'#ffffff'};
+  if (c && c.startsWith('#')) return c;
+  return map[c] || c || '';
+}
+
 function makeEntry(e,showBot){
   var t=e.type||'info';
   var d=document.createElement('div');d.className='log-entry t-'+t;d.dataset.type=t;d.dataset.bot=e.username||'';
+  var msgHtml;
+  if ((t==='kick'||t==='disconnect') && e.message && e.message.length>40) {
+    msgHtml='<span class="log-msg">'+parseMCMsg(e.message)+'</span>';
+  } else {
+    msgHtml='<span class="log-msg">'+esc(String(e.message||'').replace(/\u00a7[0-9a-fk-or]/gi,''))+'</span>';
+  }
   d.innerHTML='<span class="log-ts">'+fmt(e.ts)+'</span>'+
     (showBot?'<span class="log-bot">'+esc((e.username||'').slice(0,8))+'</span>':'')+
     '<span class="log-tag">'+(TAGS[t]||t.slice(0,5).toUpperCase())+'</span>'+
-    '<span class="log-msg">'+esc(e.message)+'</span>';
+    msgHtml;
   return d;
 }
 function matchesMain(e){return(mainBotFilter==='all'||e.username===mainBotFilter)&&(mainTypeFilter==='all'||e.type===mainTypeFilter);}
@@ -1093,14 +1512,73 @@ function rebuildDetailLog(){
   dl.scrollTop=dl.scrollHeight;
 }
 
+var MC_COMMANDS = [
+  {cmd:'/login',desc:'Login with password'},
+  {cmd:'/register',desc:'Register account'},
+  {cmd:'/tp',desc:'Teleport'},
+  {cmd:'/gamemode',desc:'Set gamemode'},
+  {cmd:'/give',desc:'Give items'},
+  {cmd:'/kill',desc:'Kill entity'},
+  {cmd:'/time',desc:'Set time'},
+  {cmd:'/weather',desc:'Set weather'},
+  {cmd:'/server',desc:'Switch server'},
+  {cmd:'/msg',desc:'Send private message'},
+  {cmd:'/home',desc:'Go to home'},
+  {cmd:'/spawn',desc:'Go to spawn'},
+  {cmd:'/warp',desc:'Warp to location'},
+  {cmd:'/back',desc:'Go back'},
+  {cmd:'/kit',desc:'Get a kit'},
+  {cmd:'/tpa',desc:'Request teleport'},
+  {cmd:'!help',desc:'Bot help command'},
+  {cmd:'!status',desc:'Bot status'},
+];
+var sugFocused = -1;
+
+function showCmdSuggestions(val){
+  var box=document.getElementById('cmd-suggestions');
+  if(!val||(!val.startsWith('/')&&!val.startsWith('!'))){box.classList.remove('show');return;}
+  var matches=MC_COMMANDS.filter(function(x){return x.cmd.startsWith(val);});
+  if(!matches.length){box.classList.remove('show');return;}
+  sugFocused=-1;
+  box.innerHTML=matches.map(function(x,i){
+    return '<div class="cmd-sug-item" data-i="'+i+'" data-cmd="'+esc(x.cmd)+'" onclick="pickSug(\''+esc(x.cmd)+'\')">'+
+      '<span class="cmd-sug-cmd">'+esc(x.cmd)+'</span>'+
+      '<span class="cmd-sug-desc">'+esc(x.desc)+'</span></div>';
+  }).join('');
+  box.classList.add('show');
+}
+
+function pickSug(cmd){
+  var inp=document.getElementById('main-cmd');
+  inp.value=cmd+' ';inp.focus();
+  document.getElementById('cmd-suggestions').classList.remove('show');
+  sugFocused=-1;
+}
+
+function handleCmdKey(ev){
+  var box=document.getElementById('cmd-suggestions');
+  var items=box.querySelectorAll('.cmd-sug-item');
+  if(ev.key==='ArrowDown'){ev.preventDefault();sugFocused=Math.min(sugFocused+1,items.length-1);items.forEach(function(el,i){el.classList.toggle('focused',i===sugFocused);});}
+  else if(ev.key==='ArrowUp'){ev.preventDefault();sugFocused=Math.max(sugFocused-1,0);items.forEach(function(el,i){el.classList.toggle('focused',i===sugFocused);});}
+  else if(ev.key==='Tab'&&box.classList.contains('show')){ev.preventDefault();var focused=sugFocused>=0?items[sugFocused]:items[0];if(focused)pickSug(focused.dataset.cmd);}
+  else if(ev.key==='Escape'){box.classList.remove('show');sugFocused=-1;}
+  else if(ev.key==='Enter'){
+    if(box.classList.contains('show')&&sugFocused>=0&&items[sugFocused]){ev.preventDefault();pickSug(items[sugFocused].dataset.cmd);return;}
+    box.classList.remove('show');sendMainCmd();
+  }
+}
+
 function sendMainCmd(){
   if(!IS_OWNER){return;}
-  if(mainBotFilter==='all'){alert('Select a specific bot tab first.');return;}
+  if(mainBotFilter==='all'){alert('Select a specific bot first.');return;}
   var inp=document.getElementById('main-cmd');if(!inp.value.trim())return;
   var cmd=inp.value.trim();inp.value='';
+  document.getElementById('cmd-suggestions').classList.remove('show');
   fetch('/bot/'+encodeURIComponent(mainBotFilter)+'/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmd})});
 }
-document.getElementById('main-cmd').addEventListener('keydown',function(e){if(e.key==='Enter')sendMainCmd();});
+document.getElementById('main-cmd').addEventListener('keydown',function(e){
+  // handled by handleCmdKey
+});
 
 function openDetail(name){
   detailBot=name;detailTypeFilter='all';
@@ -1152,10 +1630,41 @@ function renderDetailLeft(name){
     :'<div style="text-align:center;font-size:10px;color:var(--dim);margin-top:10px;padding:8px;border:1px dashed var(--border);border-radius:6px">👁 Visitor mode — actions hidden</div>');
   if(IS_OWNER){var pb=document.getElementById('detail-ping-btn');if(pb)pb.onclick=function(){pingBotServer(name);};}
 }
+var detailSugFocused=-1;
+function showDetailSugs(val){
+  var box=document.getElementById('detail-suggestions');
+  if(!val||(!val.startsWith('/')&&!val.startsWith('!'))){box.classList.remove('show');return;}
+  var matches=MC_COMMANDS.filter(function(x){return x.cmd.startsWith(val);});
+  if(!matches.length){box.classList.remove('show');return;}
+  detailSugFocused=-1;
+  box.innerHTML=matches.map(function(x,i){
+    return '<div class="cmd-sug-item" data-i="'+i+'" data-cmd="'+esc(x.cmd)+'" onclick="pickDetailSug(\''+esc(x.cmd)+'\')">'+
+      '<span class="cmd-sug-cmd">'+esc(x.cmd)+'</span><span class="cmd-sug-desc">'+esc(x.desc)+'</span></div>';
+  }).join('');
+  box.classList.add('show');
+}
+function pickDetailSug(cmd){
+  var inp=document.getElementById('detail-cmd-field');inp.value=cmd+' ';inp.focus();
+  document.getElementById('detail-suggestions').classList.remove('show');detailSugFocused=-1;
+}
+function handleDetailKey(ev){
+  var box=document.getElementById('detail-suggestions');
+  var items=box.querySelectorAll('.cmd-sug-item');
+  if(ev.key==='ArrowDown'){ev.preventDefault();detailSugFocused=Math.min(detailSugFocused+1,items.length-1);items.forEach(function(el,i){el.classList.toggle('focused',i===detailSugFocused);});}
+  else if(ev.key==='ArrowUp'){ev.preventDefault();detailSugFocused=Math.max(detailSugFocused-1,0);items.forEach(function(el,i){el.classList.toggle('focused',i===detailSugFocused);});}
+  else if(ev.key==='Tab'&&box.classList.contains('show')){ev.preventDefault();var f=detailSugFocused>=0?items[detailSugFocused]:items[0];if(f)pickDetailSug(f.dataset.cmd);}
+  else if(ev.key==='Escape'){box.classList.remove('show');detailSugFocused=-1;}
+  else if(ev.key==='Enter'){
+    if(box.classList.contains('show')&&detailSugFocused>=0&&items[detailSugFocused]){ev.preventDefault();pickDetailSug(items[detailSugFocused].dataset.cmd);return;}
+    box.classList.remove('show');sendDetailCmd();
+  }
+}
+
 async function sendDetailCmd(){
   if(!IS_OWNER||!detailBot)return;
   var inp=document.getElementById('detail-cmd-field');if(!inp.value.trim())return;
   var cmd=inp.value.trim();inp.value='';
+  document.getElementById('detail-suggestions').classList.remove('show');
   await fetch('/bot/'+encodeURIComponent(detailBot)+'/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmd})});
 }
 
@@ -1276,17 +1785,32 @@ async function saveBotServer(){
   if(d.ok)closeOverlay('bsrv-overlay');else alert('Failed');
 }
 
+var renameType='kill';
+function selectRenameType(t){
+  renameType=t;
+  ['kill','afk','custom'].forEach(function(x){
+    var el=document.getElementById('rt-'+x);
+    el.className='type-opt '+x+(t===x?' selected':'');
+  });
+}
 function openRename(name){
   if(!IS_OWNER)return;
-  activeRename=name;document.getElementById('rename-input').value=name;
+  activeRename=name;
+  document.getElementById('rename-input').value=name;
+  var cfg=botCfg[name]||{};
+  document.getElementById('rename-tag-input').value=cfg.tag||'';
+  var t=cfg.type||'kill';
+  renameType=t;
+  selectRenameType(t);
   openOverlay('rename-overlay');
   setTimeout(function(){var i=document.getElementById('rename-input');i.focus();i.select();},60);
 }
 async function doRename(){
   if(!IS_OWNER||!activeRename)return;
   var nn=document.getElementById('rename-input').value.trim();if(!nn)return;
+  var tag=document.getElementById('rename-tag-input').value.trim();
   var oldName=activeRename;
-  var d=await fetch('/bot/'+encodeURIComponent(oldName)+'/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({newName:nn})}).then(function(r){return r.json();});
+  var d=await fetch('/bot/'+encodeURIComponent(oldName)+'/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({newName:nn,tag,type:renameType})}).then(function(r){return r.json();});
   if(d.ok){if(logs[oldName]&&!logs[nn]){logs[nn]=logs[oldName];}activeRename=null;closeOverlay('rename-overlay');}
   else alert(d.reason||'Failed');
 }
@@ -1303,6 +1827,54 @@ async function saveServerConfig(){
   if(!host&&!port)return;
   var d=await fetch('/config/server',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:host||undefined,port:port||undefined})}).then(function(r){return r.json();});
   if(d.ok){updateSrvAddr(d.host,d.port);closeOverlay('srv-overlay');}else alert('Failed');
+}
+
+async function loadWlBl(){
+  try{
+    var wl=await fetch('/api/whitelist').then(r=>r.json());
+    var bl=await fetch('/api/blacklist').then(r=>r.json());
+    var myip=await fetch('/api/whoami').then(r=>r.json());
+    var mid=document.getElementById('my-ip-display');
+    if(mid)mid.textContent=myip.ip||'unknown';
+    renderWlList(wl.ips||[]);
+    renderBlList(bl.ips||[]);
+  }catch(_){}
+}
+function renderWlList(ips){
+  var el=document.getElementById('wl-list');if(!el)return;
+  el.innerHTML=ips.length?ips.map(function(ip){
+    return '<div style="display:flex;align-items:center;gap:6px;padding:3px 0;border-bottom:1px solid var(--border)">'
+      +'<span style="flex:1;color:var(--v3)">'+esc(ip)+'</span>'
+      +'<button onclick="wlRemove(\''+esc(ip)+'\')" style="background:none;border:1px solid var(--red-bd);color:var(--red);font-family:inherit;font-size:9px;padding:1px 6px;border-radius:3px;cursor:pointer">×</button>'
+      +'</div>';
+  }).join(''):'<div style="color:var(--dim);font-size:10px">No IPs whitelisted</div>';
+}
+function renderBlList(ips){
+  var el=document.getElementById('bl-list');if(!el)return;
+  el.innerHTML=ips.length?ips.map(function(ip){
+    return '<div style="display:flex;align-items:center;gap:6px;padding:3px 0;border-bottom:1px solid var(--border)">'
+      +'<span style="flex:1;color:var(--red)">🚫 '+esc(ip)+'</span>'
+      +'<button onclick="blRemove(\''+esc(ip)+'\')" style="background:none;border:1px solid var(--green-bd);color:var(--green);font-family:inherit;font-size:9px;padding:1px 6px;border-radius:3px;cursor:pointer">✓</button>'
+      +'</div>';
+  }).join(''):'<div style="color:var(--dim);font-size:10px">No IPs blacklisted</div>';
+}
+async function wlAdd(){
+  var ip=document.getElementById('wl-ip-input').value.trim();if(!ip)return;
+  await fetch('/api/whitelist/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})});
+  document.getElementById('wl-ip-input').value='';loadWlBl();
+}
+async function wlRemove(ip){
+  await fetch('/api/whitelist/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})});
+  loadWlBl();
+}
+async function blAdd(){
+  var ip=document.getElementById('bl-ip-input').value.trim();if(!ip)return;
+  await fetch('/api/blacklist/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})});
+  document.getElementById('bl-ip-input').value='';loadWlBl();
+}
+async function blRemove(ip){
+  await fetch('/api/blacklist/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})});
+  loadWlBl();
 }
 function updateSrvAddr(h,p){
   if(IS_OWNER)document.getElementById('srv-addr').textContent=(h||'?')+':'+(p||'?');
@@ -1323,9 +1895,10 @@ document.addEventListener('click',function(ev){
   var el=ev.target.closest('[data-daction]');if(!el)return;
   var a=el.dataset.daction,n=el.dataset.dbot;
   if(!IS_OWNER)return;
-  if(a==='rename'){closeOverlay('detail-overlay');openRename(n);}
-  else if(a==='proxy'){closeOverlay('detail-overlay');openProxy(n);}
-  else if(a==='bsrv'){closeOverlay('detail-overlay');openBotServer(n);}
+  // Keep detail modal open, stack sub-modals on top
+  if(a==='rename'){openRename(n);}
+  else if(a==='proxy'){openProxy(n);}
+  else if(a==='bsrv'){openBotServer(n);}
   else if(a==='inv'){openInv(n);}
   else if(a==='remove'){if(confirm('Remove '+n+'?')){doRemove(n);closeOverlay('detail-overlay');}}
 });
@@ -1347,6 +1920,7 @@ async function pingServer(){
 function openOverlay(id){
   if(!IS_OWNER&&['add-overlay','srv-overlay','proxy-overlay','rename-overlay','bsrv-overlay'].includes(id))return;
   document.getElementById(id).classList.add('show');
+  if(id==='srv-overlay'&&IS_OWNER)loadWlBl();
 }
 function closeOverlay(id){
   document.getElementById(id).classList.remove('show');
@@ -1461,6 +2035,10 @@ async function poll(){
         if(detailBot===oN){detailBot=nN;document.getElementById('detail-title').textContent='Bot: '+nN;renderDetailLeft(nN);}
       }else if(e==='proxyUpdated'){
         if(botCfg[dat.name])botCfg[dat.name].proxy=dat.proxy;renderCard(dat.name);if(detailBot===dat.name)renderDetailLeft(dat.name);
+      }else if(e==='blacklistUpdate'){
+        // Refresh lists if settings modal is open
+        var srvOv=document.getElementById('srv-overlay');
+        if(srvOv&&srvOv.classList.contains('show'))loadWlBl();
       }
     });
   }catch(_){
