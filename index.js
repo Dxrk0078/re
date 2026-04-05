@@ -4,6 +4,9 @@ const express = require('express');
 const SERVER_START = Date.now();
 const app = express();
 const PORT_WEB = process.env.PORT || 3000;
+
+// ─── Trust Railway / Railway.app reverse proxy ──────────────────────────────
+app.set('trust proxy', 1);
 app.use(express.json());
 
 const utils = require('./utils');
@@ -24,6 +27,102 @@ const botServers = {};
 const containerCache = {};
 let serverInfo = null;
 
+// ─── IP Whitelist ─────────────────────────────────────────────────────────────
+const whitelist = new Set();
+// Auto-add localhost
+whitelist.add('127.0.0.1');
+whitelist.add('::1');
+whitelist.add('::ffff:127.0.0.1');
+
+function getClientIP(req) {
+  return req.ip || req.connection.remoteAddress || '0.0.0.0';
+}
+
+function isWhitelisted(req) {
+  const ip = getClientIP(req);
+  if (whitelist.has(ip)) return true;
+  // Also check raw IPv4 from IPv6-mapped
+  const raw = ip.replace(/^::ffff:/, '');
+  return whitelist.has(raw);
+}
+
+// ─── Discord Bot ──────────────────────────────────────────────────────────────
+let discordClient = null;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN || '';
+const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID || '';
+const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || '';
+
+if (DISCORD_TOKEN) {
+  try {
+    const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+    discordClient = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+
+    discordClient.on('ready', () => {
+      console.log(`[Discord] Logged in as ${discordClient.user.tag}`);
+    });
+
+    discordClient.on('messageCreate', async (msg) => {
+      if (msg.author.bot) return;
+      if (!msg.content.startsWith('!')) return;
+      if (DISCORD_GUILD_ID && msg.guild?.id !== DISCORD_GUILD_ID) return;
+
+      const args = msg.content.slice(1).trim().split(/\s+/);
+      const cmd = args[0]?.toLowerCase();
+
+      const reply = (embed) => msg.reply({ embeds: [embed] });
+      const makeEmbed = (title, desc, color) =>
+        new EmbedBuilder().setTitle(title).setDescription(desc).setColor(color)
+          .setFooter({ text: 'MC-BOTS • DXRK @2026' }).setTimestamp();
+
+      if (cmd === 'whitelist') {
+        const sub = args[1]?.toLowerCase();
+        const ip  = args[2];
+
+        if (sub === 'add' && ip) {
+          whitelist.add(ip);
+          await reply(makeEmbed('✅ IP Whitelisted', `\`${ip}\` has been added to the whitelist.\nThey can now fully access the dashboard.`, 0x34d399));
+        } else if (sub === 'remove' && ip) {
+          whitelist.delete(ip);
+          await reply(makeEmbed('🔴 IP Removed', `\`${ip}\` has been removed from the whitelist.`, 0xf87171));
+        } else if (sub === 'list') {
+          const list = [...whitelist].join('\n') || 'None';
+          await reply(makeEmbed('📋 Whitelist', `\`\`\`\n${list}\n\`\`\``, 0x8b5cf6));
+        } else if (sub === 'clear') {
+          whitelist.clear();
+          whitelist.add('127.0.0.1'); whitelist.add('::1');
+          await reply(makeEmbed('🗑️ Cleared', 'Whitelist cleared. Only localhost remains.', 0xfbbf24));
+        } else {
+          await reply(makeEmbed('📖 Whitelist Help', [
+            '`!whitelist add <ip>` — Add IP to whitelist',
+            '`!whitelist remove <ip>` — Remove IP',
+            '`!whitelist list` — Show all whitelisted IPs',
+            '`!whitelist clear` — Clear all IPs',
+          ].join('\n'), 0xa78bfa));
+        }
+      } else if (cmd === 'status') {
+        const bots = Object.keys(botStatus).map(n =>
+          `${botStatus[n]?.online ? '🟢' : '🔴'} **${n}** — ${botStatus[n]?.online ? 'ONLINE' : 'OFFLINE'}`
+        ).join('\n') || 'No bots';
+        await reply(makeEmbed('⚡ Bot Status', bots, 0x8b5cf6));
+      } else if (cmd === 'help') {
+        await reply(makeEmbed('🤖 MC-BOTS Commands', [
+          '`!whitelist add <ip>` — Whitelist an IP address',
+          '`!whitelist remove <ip>` — Remove from whitelist',
+          '`!whitelist list` — List whitelisted IPs',
+          '`!whitelist clear` — Clear whitelist',
+          '`!status` — View bot statuses',
+          '`!help` — Show this message',
+        ].join('\n'), 0x8b5cf6));
+      }
+    });
+
+    discordClient.login(DISCORD_TOKEN).catch(e => console.error('[Discord] Login failed:', e.message));
+  } catch (e) {
+    console.warn('[Discord] discord.js not installed, skipping bot:', e.message);
+  }
+}
+
+// ─── Bot state ────────────────────────────────────────────────────────────────
 function typeLabel(t) {
   if (t === 'kill') return 'Kill Bot';
   if (t === 'afk')  return 'AFK Bot';
@@ -70,7 +169,6 @@ botEvents.on('inventory', ({ username, counts }) => {
 });
 botEvents.on('chestScan', ({ username, chests }) => {
   if (stats[username]) stats[username].chests = chests;
-  // Replace (not accumulate) to prevent item count duplication
   if (containerCache[username]) containerCache[username] = { items: chests, ts: Date.now() };
   broadcast('stats', { username, stats: stats[username] });
   broadcast('containerUpdate', { username, data: containerCache[username] });
@@ -87,7 +185,9 @@ function broadcast(event, data) {
   sseClients.forEach(res => res.write('event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n'));
 }
 
+// SSE — only whitelisted IPs can subscribe
 app.get('/events', (req, res) => {
+  if (!isWhitelisted(req)) return res.status(403).json({ error: 'forbidden' });
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -96,6 +196,48 @@ app.get('/events', (req, res) => {
   res.write('event: init\ndata: ' + JSON.stringify({ logs: logBuffer, status: botStatus, stats, coords, serverInfo, maps: botMaps, serverStart: SERVER_START, botConfigs, botServers, host: utils.HOST, port: utils.MC_PORT }) + '\n\n');
   sseClients.add(res);
   req.on('close', () => sseClients.delete(res));
+});
+
+// ─── Health endpoint ──────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  const uptime = Math.floor((Date.now() - SERVER_START) / 1000);
+  const botList = Object.entries(botStatus).map(([name, s]) => ({ name, online: s.online, running: s.running }));
+  res.json({
+    status: 'ok',
+    uptime_seconds: uptime,
+    uptime_human: [Math.floor(uptime/3600), Math.floor((uptime%3600)/60), uptime%60].map(n=>String(n).padStart(2,'0')).join(':'),
+    bots: botList,
+    server: { host: utils.HOST, port: utils.MC_PORT },
+    timestamp: new Date().toISOString(),
+    version: '2.0.0',
+    name: 'MC-BOTS by DXRK'
+  });
+});
+
+// ─── Auth check ───────────────────────────────────────────────────────────────
+app.get('/api/whoami', (req, res) => {
+  const ip = getClientIP(req);
+  const authed = isWhitelisted(req);
+  res.json({ ip, authed, mode: authed ? 'owner' : 'visitor' });
+});
+
+// ─── Whitelist API (requires already being whitelisted) ───────────────────────
+app.get('/api/whitelist', (req, res) => {
+  if (!isWhitelisted(req)) return res.status(403).json({ error: 'forbidden' });
+  res.json({ ips: [...whitelist] });
+});
+app.post('/api/whitelist/add', (req, res) => {
+  if (!isWhitelisted(req)) return res.status(403).json({ error: 'forbidden' });
+  const { ip } = req.body;
+  if (!ip) return res.status(400).json({ error: 'ip required' });
+  whitelist.add(ip);
+  res.json({ ok: true, ip });
+});
+app.post('/api/whitelist/remove', (req, res) => {
+  if (!isWhitelisted(req)) return res.status(403).json({ error: 'forbidden' });
+  const { ip } = req.body;
+  whitelist.delete(ip);
+  res.json({ ok: true, ip });
 });
 
 // ─── Bot launcher ─────────────────────────────────────────────────────────────
@@ -111,8 +253,14 @@ function launchBot(name) {
   return ctrl;
 }
 
-// ─── API ──────────────────────────────────────────────────────────────────────
-app.post('/bot/:name/start', (req, res) => {
+// ─── Protected API middleware ─────────────────────────────────────────────────
+function requireAuth(req, res, next) {
+  if (!isWhitelisted(req)) return res.status(403).json({ ok: false, reason: 'Not whitelisted. Contact admin via Discord.' });
+  next();
+}
+
+// ─── API (protected) ──────────────────────────────────────────────────────────
+app.post('/bot/:name/start', requireAuth, (req, res) => {
   const name = req.params.name;
   if (!botStatus[name]) return res.json({ ok: false, reason: 'unknown bot' });
   if (botStatus[name].running) return res.json({ ok: false, reason: 'already running' });
@@ -122,7 +270,7 @@ app.post('/bot/:name/start', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/bot/:name/stop', (req, res) => {
+app.post('/bot/:name/stop', requireAuth, (req, res) => {
   const name = req.params.name;
   if (!botStatus[name]) return res.json({ ok: false, reason: 'unknown bot' });
   botStatus[name].running = false;
@@ -133,7 +281,7 @@ app.post('/bot/:name/stop', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/bot/add', (req, res) => {
+app.post('/bot/add', requireAuth, (req, res) => {
   const { name, type, tag, host, port } = req.body;
   if (!name || !name.trim()) return res.json({ ok: false, reason: 'name required' });
   const n = name.trim();
@@ -148,7 +296,7 @@ app.post('/bot/add', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/bot/:name/remove', (req, res) => {
+app.post('/bot/:name/remove', requireAuth, (req, res) => {
   const name = req.params.name;
   if (!botStatus[name]) return res.json({ ok: false, reason: 'unknown bot' });
   if (controllers[name]) { try { controllers[name].stop(); } catch(_){} delete controllers[name]; }
@@ -158,7 +306,7 @@ app.post('/bot/:name/remove', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/bot/:name/rename', (req, res) => {
+app.post('/bot/:name/rename', requireAuth, (req, res) => {
   const oldName = req.params.name;
   const { newName } = req.body;
   if (!newName || !newName.trim()) return res.json({ ok: false, reason: 'name required' });
@@ -182,7 +330,7 @@ app.post('/bot/:name/rename', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/bot/:name/proxy', (req, res) => {
+app.post('/bot/:name/proxy', requireAuth, (req, res) => {
   const name = req.params.name;
   if (!botConfigs[name]) return res.json({ ok: false, reason: 'unknown bot' });
   const { host, port, type, username, password } = req.body;
@@ -191,7 +339,7 @@ app.post('/bot/:name/proxy', (req, res) => {
   res.json({ ok: true, proxy: botConfigs[name].proxy });
 });
 
-app.post('/bot/:name/server', (req, res) => {
+app.post('/bot/:name/server', requireAuth, (req, res) => {
   const name = req.params.name;
   if (!botConfigs[name]) return res.json({ ok: false, reason: 'unknown bot' });
   const { host, port } = req.body;
@@ -201,15 +349,15 @@ app.post('/bot/:name/server', (req, res) => {
   res.json({ ok: true, server: botServers[name] });
 });
 
-app.get('/config/server', (req, res) => res.json({ host: utils.HOST, port: utils.MC_PORT }));
-app.post('/config/server', (req, res) => {
+app.get('/config/server', requireAuth, (req, res) => res.json({ host: utils.HOST, port: utils.MC_PORT }));
+app.post('/config/server', requireAuth, (req, res) => {
   const { host, port } = req.body;
   utils.setServer(host || utils.HOST, port ? parseInt(port) : utils.MC_PORT);
   broadcast('serverConfig', { host: utils.HOST, port: utils.MC_PORT });
   res.json({ ok: true, host: utils.HOST, port: utils.MC_PORT });
 });
 
-app.post('/bot/:name/cmd', (req, res) => {
+app.post('/bot/:name/cmd', requireAuth, (req, res) => {
   const { name } = req.params, { cmd } = req.body;
   if (!cmd) return res.json({ ok: false, reason: 'no command' });
   const bot = botRegistry[name];
@@ -218,7 +366,7 @@ app.post('/bot/:name/cmd', (req, res) => {
   catch (e) { res.json({ ok: false, reason: e.message }); }
 });
 
-app.post('/bot/:name/coords', (req, res) => {
+app.post('/bot/:name/coords', requireAuth, (req, res) => {
   const name = req.params.name, bot = botRegistry[name];
   if (!bot || !bot.entity) return res.json({ ok: false, reason: 'bot not connected' });
   try {
@@ -228,27 +376,26 @@ app.post('/bot/:name/coords', (req, res) => {
   } catch (e) { res.json({ ok: false, reason: e.message }); }
 });
 
-app.post('/bot/:name/chestscan', (req, res) => {
+app.post('/bot/:name/chestscan', requireAuth, (req, res) => {
   const name = req.params.name, bot = botRegistry[name];
   if (!bot) return res.json({ ok: false, reason: 'bot not connected' });
   emit(name, 'info', 'Manual container scan triggered...');
-  // Reset cache before scan — prevents item count duplication on repeated scans
   containerCache[name] = { items: {}, ts: 0 };
   scanInventoryAndChests(bot, name).catch(() => {});
   res.json({ ok: true });
 });
 
-app.get('/bot/:name/containers', (req, res) => {
+app.get('/bot/:name/containers', requireAuth, (req, res) => {
   res.json({ ok: true, data: containerCache[req.params.name] || { items: {}, ts: 0 } });
 });
 
-app.get('/bot/:name/map', (req, res) => {
+app.get('/bot/:name/map', requireAuth, (req, res) => {
   const map = botMaps[req.params.name];
   if (!map) return res.json({ ok: false, reason: 'no map data' });
   res.json({ ok: true, ...map });
 });
 
-app.get('/serverinfo', async (req, res) => {
+app.get('/serverinfo', requireAuth, async (req, res) => {
   try {
     const host = req.query.host || utils.HOST;
     const port = req.query.port ? parseInt(req.query.port) : utils.MC_PORT;
@@ -262,8 +409,25 @@ const eventQueue = []; let eventId = 0;
 botEvents.on('log', (entry) => { eventQueue.push({ id: ++eventId, event: 'log', data: entry }); if (eventQueue.length > 500) eventQueue.shift(); });
 
 app.get('/poll', (req, res) => {
+  // Visitors get limited state (no sensitive data)
+  const authed = isWhitelisted(req);
   const since = parseInt(req.query.since) || 0;
-  res.json({ lastId: eventId, events: eventQueue.filter(e => e.id > since), state: { status: botStatus, stats, coords, serverInfo, serverStart: SERVER_START, host: utils.HOST, port: utils.MC_PORT, botConfigs, botServers } });
+  const safeStatus = {};
+  for (const [k,v] of Object.entries(botStatus)) {
+    safeStatus[k] = { online: v.online, type: v.type, running: authed ? v.running : false };
+  }
+  const state = {
+    status: safeStatus,
+    stats: authed ? stats : {},
+    coords: authed ? coords : {},
+    serverInfo: authed ? serverInfo : (serverInfo ? { motd: serverInfo.motd, onlinePlayers: serverInfo.onlinePlayers, maxPlayers: serverInfo.maxPlayers, version: serverInfo.version } : null),
+    serverStart: SERVER_START,
+    host: authed ? utils.HOST : '██████████',
+    port: authed ? utils.MC_PORT : '█████',
+    botConfigs: authed ? botConfigs : {},
+    botServers: authed ? botServers : {}
+  };
+  res.json({ lastId: eventId, events: authed ? eventQueue.filter(e => e.id > since) : [], state });
 });
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
@@ -275,7 +439,8 @@ function HTML() { return `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NEXUS Bot Control</title>
+<title>MC-BOTS | DXRK</title>
+<link rel="icon" type="image/png" href="https://img.icons8.com/?size=50&id=44335&format=png">
 <style>
 :root{
   --fd:'Rajdhani','Segoe UI','Ubuntu',Arial,sans-serif;
@@ -301,10 +466,18 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
 .blob3{width:400px;height:400px;background:radial-gradient(circle,rgba(180,60,255,.15),transparent 70%);top:40%;left:40%;animation-delay:-14s}
 @keyframes blobMove{0%,100%{transform:translate(0,0) scale(1)}33%{transform:translate(30px,-40px) scale(1.05)}66%{transform:translate(-20px,25px) scale(.95)}}
 .content{position:relative;z-index:1;display:flex;flex-direction:column;min-height:100vh}
+
 /* Header */
-.hdr{background:rgba(10,5,30,0.95);border-bottom:1px solid var(--border);padding:10px 22px;display:flex;align-items:center;gap:14px;position:sticky;top:0;z-index:50;backdrop-filter:blur(20px)}
-.logo{font-family:var(--fd);font-size:22px;font-weight:700;letter-spacing:4px;background:linear-gradient(135deg,var(--v3),var(--v),var(--vneon));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;filter:drop-shadow(0 0 12px rgba(139,92,246,.6))}
-.logo span{-webkit-text-fill-color:rgba(255,255,255,.5)}
+.hdr{background:rgba(10,5,30,0.97);border-bottom:1px solid var(--border);padding:10px 22px;display:flex;align-items:center;gap:14px;position:sticky;top:0;z-index:50;backdrop-filter:blur(20px)}
+.logo-wrap{display:flex;align-items:center;gap:10px}
+.logo-icon{width:32px;height:32px;border-radius:8px;overflow:hidden;filter:drop-shadow(0 0 10px rgba(139,92,246,.9)) drop-shadow(0 0 20px rgba(139,92,246,.5));animation:iconGlow 3s ease-in-out infinite}
+.logo-icon img{width:100%;height:100%}
+@keyframes iconGlow{0%,100%{filter:drop-shadow(0 0 10px rgba(139,92,246,.9)) drop-shadow(0 0 20px rgba(139,92,246,.5))}50%{filter:drop-shadow(0 0 18px rgba(167,139,250,1)) drop-shadow(0 0 35px rgba(139,92,246,.8))}}
+.logo{font-family:var(--fd);font-size:22px;font-weight:700;letter-spacing:4px;background:linear-gradient(135deg,#fff,var(--v3),var(--v),var(--vneon));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;filter:drop-shadow(0 0 16px rgba(139,92,246,.9));animation:logoGlow 3s ease-in-out infinite}
+@keyframes logoGlow{0%,100%{filter:drop-shadow(0 0 12px rgba(139,92,246,.7))}50%{filter:drop-shadow(0 0 26px rgba(167,139,250,1)) drop-shadow(0 0 40px rgba(139,92,246,.6))}}
+.logo-sub{font-family:var(--fd);font-size:9px;letter-spacing:3px;color:var(--dim);margin-top:-4px;font-weight:600}
+.dxrk-badge{font-family:var(--fd);font-size:10px;font-weight:700;letter-spacing:2px;padding:3px 10px;border-radius:20px;background:linear-gradient(135deg,rgba(124,58,237,.25),rgba(139,92,246,.1));border:1px solid rgba(139,92,246,.4);color:var(--v3);filter:drop-shadow(0 0 8px rgba(139,92,246,.6));animation:dxrkGlow 2.5s ease-in-out infinite;cursor:default;user-select:none}
+@keyframes dxrkGlow{0%,100%{box-shadow:0 0 8px rgba(139,92,246,.4),0 0 16px rgba(139,92,246,.15);color:var(--v3)}50%{box-shadow:0 0 16px rgba(167,139,250,.7),0 0 30px rgba(139,92,246,.35);color:#fff;border-color:rgba(167,139,250,.7)}}
 .uptime-pill{background:var(--glass);border:1px solid var(--border);border-radius:20px;padding:3px 12px;font-size:11px;color:var(--dim2);display:flex;align-items:center;gap:6px}
 .uptime-pill .dot{width:6px;height:6px;border-radius:50%;background:var(--v);box-shadow:0 0 8px var(--v);animation:pulse 2s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
@@ -316,6 +489,14 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
 .conn-dot.dead{background:var(--red)}
 .icon-btn{background:var(--glass);border:1px solid var(--border);color:var(--dim2);border-radius:8px;padding:6px 10px;cursor:pointer;font-size:14px;transition:all .2s;font-family:inherit}
 .icon-btn:hover{border-color:var(--v);color:var(--v2);box-shadow:var(--glow)}
+/* Visitor banner */
+.visitor-bar{background:linear-gradient(135deg,rgba(251,191,36,.08),rgba(251,191,36,.04));border-bottom:1px solid rgba(251,191,36,.3);padding:8px 22px;display:flex;align-items:center;gap:10px;font-family:var(--fd);font-size:12px;color:var(--yellow);letter-spacing:.5px}
+.visitor-bar .v-icon{font-size:16px}
+.visitor-bar .v-link{color:var(--v2);text-decoration:underline dotted;cursor:pointer;margin-left:auto;font-size:11px}
+/* Fake overlay */
+.fake-wrap{position:relative;display:inline-block}
+.fake-mask{position:absolute;inset:0;background:linear-gradient(90deg,rgba(5,2,16,.9),rgba(15,7,42,.95));border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--dim);font-family:var(--fd);letter-spacing:1px;z-index:5;backdrop-filter:blur(6px)}
+.redact{filter:blur(6px);user-select:none;pointer-events:none;opacity:.4}
 /* Server bar */
 .srv-bar{background:rgba(12,6,32,0.9);border-bottom:1px solid var(--border);padding:8px 22px;display:flex;align-items:center;gap:12px;backdrop-filter:blur(10px)}
 .srv-favicon{width:34px;height:34px;border-radius:6px;background:var(--glass);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:16px;overflow:hidden;flex-shrink:0;image-rendering:pixelated}
@@ -368,21 +549,18 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
 .coords-ts{color:var(--dim);font-size:9px}
 .coords-refresh{background:none;border:none;color:var(--dim);cursor:pointer;font-size:12px;padding:0;transition:color .2s;line-height:1}
 .coords-refresh:hover{color:var(--teal)}
-/* Inventory row */
 .inv-row{background:rgba(0,0,0,.22);border:1px solid var(--border);border-radius:6px;padding:5px 8px;margin-bottom:8px;display:flex;align-items:center;gap:5px;font-size:10px}
 .inv-summary{color:var(--dim2);flex:1;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .inv-open-btn{background:rgba(139,92,246,.12);border:1px solid var(--border);color:var(--v2);font-family:inherit;font-size:9px;padding:2px 7px;border-radius:4px;cursor:pointer;transition:all .2s;flex-shrink:0}
 .inv-open-btn:hover{border-color:var(--v);background:rgba(139,92,246,.25)}
 .scan-btn{background:none;border:1px solid var(--border);color:var(--dim);font-family:inherit;font-size:9px;padding:2px 7px;border-radius:4px;cursor:pointer;transition:all .2s;flex-shrink:0}
 .scan-btn:hover{border-color:var(--orange);color:var(--orange)}
-/* Proxy */
 .proxy-row{display:flex;align-items:center;gap:5px;margin-bottom:8px;font-size:10px}
 .proxy-badge{display:flex;align-items:center;gap:3px;padding:2px 7px;border-radius:4px;font-size:9px;font-family:var(--fd);font-weight:600;letter-spacing:.5px}
 .proxy-badge.active{background:rgba(251,191,36,.1);color:var(--yellow);border:1px solid rgba(251,191,36,.3)}
 .proxy-badge.inactive{background:var(--glass);color:var(--dim);border:1px solid var(--border)}
 .proxy-set-btn{margin-left:auto;background:none;border:1px solid var(--border);color:var(--dim);font-family:inherit;font-size:9px;padding:2px 7px;border-radius:4px;cursor:pointer;transition:all .2s}
 .proxy-set-btn:hover{border-color:var(--yellow);color:var(--yellow)}
-/* Action buttons */
 .actions{display:flex;gap:4px}
 .act-btn{flex:1;min-width:0;border-radius:6px;padding:6px 3px;font-family:var(--fd);font-size:11px;font-weight:700;letter-spacing:.5px;cursor:pointer;transition:all .2s;border:1px solid;text-align:center}
 .act-btn:disabled{opacity:.25;cursor:not-allowed}
@@ -395,12 +573,10 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
 .btn-ico:hover{border-color:var(--v);box-shadow:var(--glow)}
 .btn-remove{flex:0 0 26px;background:var(--glass);color:var(--dim);border-color:var(--border);font-size:10px}
 .btn-remove:hover{border-color:var(--red-bd);color:var(--red)}
-/* Add card */
 .add-card{background:var(--glass);border:1px dashed var(--border);border-radius:var(--r);padding:16px;width:150px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;cursor:pointer;transition:all .3s;min-height:180px;flex-shrink:0}
 .add-card:hover{border-color:var(--v);background:rgba(139,92,246,.08);box-shadow:var(--glow)}
 .add-icon{font-size:30px;opacity:.4}
 .add-label{font-family:var(--fd);font-size:13px;font-weight:600;color:var(--dim);letter-spacing:1px}
-/* Unified log panel */
 .log-panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);display:flex;flex-direction:column;overflow:hidden;height:310px}
 .log-head{padding:6px 10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:5px;flex-shrink:0;background:rgba(0,0,0,.2);flex-wrap:nowrap;overflow:hidden}
 .log-title{font-family:var(--fd);color:var(--v2);font-weight:700;font-size:12px;letter-spacing:.5px;flex-shrink:0;margin-right:4px}
@@ -446,7 +622,6 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
 .modal-title{font-family:var(--fd);font-weight:700;font-size:15px;color:var(--v2);flex:1;letter-spacing:.5px}
 .modal-x{background:none;border:none;color:var(--dim);cursor:pointer;font-size:17px;line-height:1;transition:color .2s;padding:2px 5px}
 .modal-x:hover{color:var(--red)}
-/* Detail modal */
 #detail-overlay .modal{width:710px;max-width:97vw;height:80vh}
 .detail-body{flex:1;display:flex;overflow:hidden}
 .detail-left{width:210px;flex-shrink:0;border-right:1px solid var(--border);padding:12px;display:flex;flex-direction:column;gap:9px;overflow-y:auto}
@@ -468,16 +643,13 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
 .detail-cmd{display:flex;border-top:1px solid var(--border);flex-shrink:0}
 .detail-field{flex:1;background:rgba(0,0,0,.5);border:none;color:var(--text);font-family:var(--fm);font-size:12px;padding:9px 12px;outline:none}
 .detail-send{background:var(--green-bg);border:none;border-left:1px solid var(--border);color:var(--green);font-family:var(--fd);font-weight:700;padding:9px 16px;cursor:pointer;font-size:12px;letter-spacing:.5px}
-/* Inventory modal */
 #inv-overlay .modal{width:450px;max-width:95vw}
 .inv-body{padding:14px;display:flex;flex-direction:column;gap:10px;max-height:68vh;overflow-y:auto}
 .inv-sec-title{font-family:var(--fd);font-size:10px;font-weight:700;letter-spacing:1.5px;color:var(--dim2);border-bottom:1px solid var(--border);padding-bottom:4px}
 .inv-grid{display:flex;flex-wrap:wrap;gap:5px;margin-top:5px}
 .inv-chip{background:rgba(0,0,0,.32);border:1px solid var(--border);border-radius:5px;padding:3px 9px;font-size:10px;display:flex;align-items:center;gap:5px}
-.inv-chip-name{color:var(--dim2)}
-.inv-chip-count{color:var(--orange);font-weight:700}
+.inv-chip-name{color:var(--dim2)}.inv-chip-count{color:var(--orange);font-weight:700}
 .inv-empty{color:var(--dim);font-size:10px;font-style:italic}
-/* Map modal */
 #map-overlay .modal{width:380px;max-width:95vw}
 .map-body{padding:16px;display:flex;flex-direction:column;align-items:center;gap:10px}
 #map-img{width:256px;height:256px;background:rgba(0,0,0,.4);border:2px solid var(--border2);border-radius:6px;display:flex;align-items:center;justify-content:center;color:var(--dim);font-size:11px;text-align:center;image-rendering:pixelated}
@@ -491,7 +663,6 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
 .map-refresh:hover{border-color:var(--v);color:var(--v2)}
 .map-status{font-size:11px;min-height:15px;font-family:var(--fd);font-weight:600}
 .map-status.ok{color:var(--green)}.map-status.err{color:var(--red)}
-/* Shared modal body */
 .modal-body{padding:16px;display:flex;flex-direction:column;gap:11px}
 .field-group{display:flex;flex-direction:column;gap:5px}
 .field-label{font-family:var(--fd);font-size:11px;font-weight:600;letter-spacing:1px;color:var(--dim2)}
@@ -518,6 +689,10 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
 #add-overlay .modal{width:400px;max-width:95vw}
 #srv-overlay .modal,#proxy-overlay .modal,#bsrv-overlay .modal{width:390px;max-width:95vw}
 #rename-overlay .modal{width:350px;max-width:95vw}
+/* Footer */
+.footer{text-align:center;padding:14px;font-family:var(--fd);font-size:10px;color:var(--dim);letter-spacing:2px;border-top:1px solid var(--border);background:rgba(5,2,16,.8)}
+.footer .copy{color:var(--v3);filter:drop-shadow(0 0 6px rgba(139,92,246,.5));font-weight:700}
+.footer .dxrk-f{background:linear-gradient(135deg,var(--v3),var(--v));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;font-size:12px;letter-spacing:3px}
 ::-webkit-scrollbar{width:4px;height:4px}
 ::-webkit-scrollbar-thumb{background:rgba(139,92,246,.35);border-radius:4px}
 ::-webkit-scrollbar-track{background:transparent}
@@ -530,13 +705,26 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
 <div class="content">
 
 <div class="hdr">
-  <div class="logo">NEXUS<span>BOT</span></div>
+  <div class="logo-wrap">
+    <div class="logo-icon"><img src="https://img.icons8.com/?size=50&id=44335&format=png" alt="MC"></div>
+    <div>
+      <div class="logo">MC-BOTS</div>
+      <div class="logo-sub">NEXUS CONTROL PANEL</div>
+    </div>
+  </div>
+  <div class="dxrk-badge">⬡ DXRK</div>
   <div class="uptime-pill"><div class="dot"></div>UP <span id="uptime">00:00:00</span></div>
   <div class="hdr-right">
     <div class="conn-pill"><div class="conn-dot" id="conn-dot"></div><span id="conn-text" style="font-size:10px;color:var(--dim2)">Connecting</span></div>
     <button class="icon-btn" onclick="startPoll()" title="Reconnect">&#8635;</button>
-    <button class="icon-btn" onclick="openOverlay('srv-overlay')" title="Server Settings">&#9881;</button>
+    <button class="icon-btn visitor-only-hide" onclick="openOverlay('srv-overlay')" title="Server Settings">&#9881;</button>
   </div>
+</div>
+
+<div class="visitor-bar" id="visitor-bar" style="display:none">
+  <span class="v-icon">👁</span>
+  <span>You are in <strong>VISITOR MODE</strong> — View only. To gain full access, contact the admin via Discord and request your IP to be whitelisted.</span>
+  <span class="v-link" id="your-ip-lbl"></span>
 </div>
 
 <div class="srv-bar">
@@ -549,7 +737,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
       <span id="srv-ver" style="color:var(--dim)">--</span>
     </div>
   </div>
-  <button class="ping-btn" onclick="pingServer()">PING</button>
+  <button class="ping-btn owner-only" onclick="pingServer()">PING</button>
 </div>
 
 <div class="main">
@@ -573,10 +761,14 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
     </div>
     <div class="log-area" id="main-log"></div>
     <div class="log-cmd-bar">
-      <input class="cmd-field" id="main-cmd" placeholder="Select a bot tab, then type command...">
-      <button class="cmd-go" onclick="sendMainCmd()">&#9654;</button>
+      <input class="cmd-field owner-only-input" id="main-cmd" placeholder="Select a bot tab, then type command...">
+      <button class="cmd-go owner-only" onclick="sendMainCmd()">&#9654;</button>
     </div>
   </div>
+</div>
+
+<div class="footer">
+  <span class="copy">© </span><span class="dxrk-f">DXRK</span> <span class="copy">@2026</span> &nbsp;·&nbsp; MC-BOTS &nbsp;·&nbsp; All Rights Reserved
 </div>
 </div>
 
@@ -600,8 +792,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
         </div>
         <div class="detail-log" id="detail-log"></div>
         <div class="detail-cmd">
-          <input class="detail-field" id="detail-cmd-field" placeholder="Type command..." onkeydown="if(event.key==='Enter')sendDetailCmd()">
-          <button class="detail-send" onclick="sendDetailCmd()">SEND</button>
+          <input class="detail-field owner-only-input" id="detail-cmd-field" placeholder="Type command..." onkeydown="if(event.key==='Enter')sendDetailCmd()">
+          <button class="detail-send owner-only" onclick="sendDetailCmd()">SEND</button>
         </div>
       </div>
     </div>
@@ -655,7 +847,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
           <input class="field-input" id="add-port" placeholder="25565" type="number">
         </div>
       </div>
-      <div class="btn-row"><button class="modal-btn" onclick="doAddBot()">LAUNCH BOT</button><button class="modal-btn-sec" onclick="closeOverlay('add-overlay')">Cancel</button></div>
+      <div class="btn-row"><button class="modal-btn" onclick="doAddBot()">LAUNCH BOTS</button><button class="modal-btn-sec" onclick="closeOverlay('add-overlay')">Cancel</button></div>
     </div>
   </div>
 </div>
@@ -719,7 +911,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--fm);font-size:13px
 var MAXD=200;
 var TAGS={info:'INFO',error:'ERR',kick:'KICK',disconnect:'DISC',reconnect:'RCON',kill:'KILL',food:'FOOD',chat:'CHAT',inv:'INV'};
 var status={},stats={},coords={},botCfg={},botSrv={},containers={},logs={};
-var botServerInfo={};  // per-bot server ping cache
+var botServerInfo={};
 var allLogs=[];
 var lastId=0,init=false,serverStart=null,pollTimer=null;
 var mainBotFilter='all',mainTypeFilter='all';
@@ -727,6 +919,32 @@ var detailBot=null,detailTypeFilter='all';
 var activeMap=null,activeProxy=null,activeRename=null,activeBotSrv=null,activeInv=null;
 var addType='kill';
 var serverInfo=null;
+var IS_OWNER = false;   // set after /api/whoami
+
+// ── Auth check ──────────────────────────────────────────────────────────────
+(async function checkAuth(){
+  try{
+    var d=await fetch('/api/whoami').then(r=>r.json());
+    IS_OWNER=d.authed;
+    if(!IS_OWNER){
+      document.getElementById('visitor-bar').style.display='flex';
+      document.getElementById('your-ip-lbl').textContent='Your IP: '+d.ip;
+      // Disable all owner-only controls
+      document.querySelectorAll('.owner-only').forEach(el=>{el.disabled=true;el.style.opacity='.3';el.style.cursor='not-allowed';});
+      document.querySelectorAll('.owner-only-input').forEach(el=>{el.disabled=true;el.placeholder='[Visitor — Read Only]';});
+      // Hide add card for visitors
+      var ac=document.getElementById('add-card-btn');if(ac)ac.style.display='none';
+      // Redact server address
+      document.getElementById('srv-addr').classList.add('redact');
+      document.getElementById('srv-addr').title='';
+      document.getElementById('srv-addr').style.cursor='default';
+      document.getElementById('srv-addr').onclick=null;
+      // Replace with fake addr
+      document.getElementById('srv-addr').textContent='██████:█████';
+      document.getElementById('srv-players').textContent='?/?';
+    }
+  }catch(_){}
+})();
 
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function fmt(ts){return new Date(ts).toTimeString().slice(0,8);}
@@ -743,7 +961,6 @@ function skinSvg(name){var c=nameColor(name),l=name.slice(0,2).toUpperCase();ret
 
 function scrollCards(dir){document.getElementById('cards').scrollLeft+=dir*300;}
 
-// ── Render card ──────────────────────────────────────────────────────────
 function renderCard(name){
   var el=document.getElementById('bc-'+name);
   if(!el){
@@ -759,8 +976,10 @@ function renderCard(name){
   var typeCls=t==='kill'?'type-kill':t==='afk'?'type-afk':'type-custom';
   var typeText=t==='kill'?'&#9876; KILL':t==='afk'?'&#128164; AFK':'&#9881; '+(t.toUpperCase().slice(0,8));
   var inv=st.inventory||{},invKeys=Object.keys(inv);
-  var invSummary=invKeys.length?invKeys.map(function(k){return inv[k]+'x '+k.replace(/_/g,' ');}).join(', '):'empty';
+  var invSummary=IS_OWNER?(invKeys.length?invKeys.map(function(k){return inv[k]+'x '+k.replace(/_/g,' ');}).join(', '):'empty'):'[visitor mode]';
   var proxy=cfg.proxy;
+  var proxyDisplay=IS_OWNER?(proxy?'&#127760; '+esc(proxy.host)+':'+proxy.port:'&#128275; DIRECT'):'&#128275; DIRECT';
+  var coordsDisplay=IS_OWNER?(cr?'X:'+cr.x+' Y:'+cr.y+' Z:'+cr.z:'unknown'):'[redacted]';
   el.className='bot-card '+(isOnline?'online':'offline');
   el.innerHTML=
     '<div class="card-top">'+
@@ -769,42 +988,45 @@ function renderCard(name){
         '<div class="bot-name-row">'+
           '<div class="bot-name" title="'+esc(name)+'">'+esc(name)+'</div>'+
           (cfg.tag?'<span class="bot-tag">'+esc(cfg.tag)+'</span>':'')+
-          '<button class="rename-btn" data-action="openrename" data-bot="'+esc(name)+'">&#9998;</button>'+
+          (IS_OWNER?'<button class="rename-btn" data-action="openrename" data-bot="'+esc(name)+'">&#9998;</button>':'')+
         '</div>'+
         '<div class="bot-type-badge '+typeCls+'">'+typeText+'</div>'+
       '</div>'+
       '<div class="status-badge '+(isOnline?'online':'offline')+'">'+(isOnline?'LIVE':'OFF')+'</div>'+
     '</div>'+
     '<div class="stats-row">'+
-      '<div class="stat-box"><div class="stat-label">KILLS</div><div class="stat-val">'+(st.ghastKills||0)+'</div></div>'+
-      '<div class="stat-box"><div class="stat-label">FOOD</div><div class="stat-val">'+(st.foodAte||0)+'</div></div>'+
+      '<div class="stat-box"><div class="stat-label">KILLS</div><div class="stat-val">'+(IS_OWNER?(st.ghastKills||0):'?')+'</div></div>'+
+      '<div class="stat-box"><div class="stat-label">FOOD</div><div class="stat-val">'+(IS_OWNER?(st.foodAte||0):'?')+'</div></div>'+
     '</div>'+
     '<div class="coords-row">'+
       '<span style="font-size:11px">&#128205;</span>'+
-      '<span class="coords-xyz">'+(cr?'X:'+cr.x+' Y:'+cr.y+' Z:'+cr.z:'unknown')+'</span>'+
-      (cr?'<span class="coords-ts">'+ago(cr.ts)+'</span>':'')+
-      '<button class="coords-refresh" data-action="coords" data-bot="'+esc(name)+'">&#8635;</button>'+
+      '<span class="coords-xyz">'+(IS_OWNER?coordsDisplay:'<span class="redact">X:1234 Y:64 Z:5678</span>')+'</span>'+
+      (IS_OWNER&&cr?'<span class="coords-ts">'+ago(cr.ts)+'</span>':'')+
+      (IS_OWNER?'<button class="coords-refresh" data-action="coords" data-bot="'+esc(name)+'">&#8635;</button>':'')+
     '</div>'+
     '<div class="inv-row">'+
       '<span style="font-size:11px">&#127974;</span>'+
-      '<span class="inv-summary">'+esc(invSummary)+'</span>'+
-      '<button class="inv-open-btn" data-action="openinv" data-bot="'+esc(name)+'">INV</button>'+
-      '<button class="scan-btn" data-action="chestscan" data-bot="'+esc(name)+'">SCAN</button>'+
+      '<span class="inv-summary">'+(IS_OWNER?esc(invSummary):'<span class="redact">64x diamond_sword, 32x cooked_beef</span>')+'</span>'+
+      (IS_OWNER?'<button class="inv-open-btn" data-action="openinv" data-bot="'+esc(name)+'">INV</button>':'')+
+      (IS_OWNER?'<button class="scan-btn" data-action="chestscan" data-bot="'+esc(name)+'">SCAN</button>':'')+
     '</div>'+
     '<div class="proxy-row">'+
-      '<div class="proxy-badge '+(proxy?'active':'inactive')+'">'+(proxy?'&#127760; '+esc(proxy.host)+':'+proxy.port:'&#128275; DIRECT')+'</div>'+
-      '<button class="proxy-set-btn" data-action="openproxy" data-bot="'+esc(name)+'">PROXY</button>'+
+      '<div class="proxy-badge '+(IS_OWNER&&proxy?'active':'inactive')+'">'+(IS_OWNER?proxyDisplay:'&#128275; DIRECT')+'</div>'+
+      (IS_OWNER?'<button class="proxy-set-btn" data-action="openproxy" data-bot="'+esc(name)+'">PROXY</button>':'')+
     '</div>'+
     '<div class="actions">'+
-      '<button class="act-btn btn-start" data-action="start" data-bot="'+esc(name)+'" '+(isRunning?'disabled':'')+'>&#9654; START</button>'+
-      '<button class="act-btn btn-stop" data-action="stop" data-bot="'+esc(name)+'" '+(!isRunning?'disabled':'')+'>&#9632; STOP</button>'+
-      '<button class="act-btn btn-ico" data-action="openmap" data-bot="'+esc(name)+'" title="Map">&#128506;</button>'+
-      '<button class="act-btn btn-ico" data-action="openbsrv" data-bot="'+esc(name)+'" title="Server IP">&#127760;</button>'+
-      '<button class="act-btn btn-remove" data-action="remove" data-bot="'+esc(name)+'" title="Remove">&#10005;</button>'+
+      (IS_OWNER?
+        '<button class="act-btn btn-start" data-action="start" data-bot="'+esc(name)+'" '+(isRunning?'disabled':'')+'>&#9654; START</button>'+
+        '<button class="act-btn btn-stop" data-action="stop" data-bot="'+esc(name)+'" '+(!isRunning?'disabled':'')+'>&#9632; STOP</button>'+
+        '<button class="act-btn btn-ico" data-action="openmap" data-bot="'+esc(name)+'" title="Map">&#128506;</button>'+
+        '<button class="act-btn btn-ico" data-action="openbsrv" data-bot="'+esc(name)+'" title="Server IP">&#127760;</button>'+
+        '<button class="act-btn btn-remove" data-action="remove" data-bot="'+esc(name)+'" title="Remove">&#10005;</button>'
+        :
+        '<div style="width:100%;text-align:center;font-size:10px;color:var(--dim);font-family:var(--fd);letter-spacing:1px;padding:6px">👁 VISITOR — READ ONLY</div>'
+      )+
     '</div>';
 }
 
-// ── Unified log panel ─────────────────────────────────────────────────────
 function updateBotTabs(){
   var t=document.getElementById('bot-tabs');
   t.innerHTML='<button class="bot-tab'+(mainBotFilter==='all'?' active':'')+'" data-tab="all">ALL</button>';
@@ -812,7 +1034,6 @@ function updateBotTabs(){
     t.innerHTML+='<button class="bot-tab'+(mainBotFilter===n?' active':'')+'" data-tab="'+esc(n)+'">'+esc(n)+'</button>';
   });
 }
-// Bot tab click via delegation (safe for any bot name)
 document.getElementById('bot-tabs').addEventListener('click',function(ev){
   var btn=ev.target.closest('[data-tab]');if(!btn)return;
   setMainBotFilter(btn.dataset.tab);
@@ -822,7 +1043,6 @@ function setMainBotFilter(n){
   document.getElementById('main-cmd').placeholder=n==='all'?'Select a bot tab first...':'/cmd \u2192 '+n+'...';
 }
 
-// Wire up type filter buttons
 document.addEventListener('click',function(ev){
   var lf=ev.target.closest('[data-lf]');
   if(lf){mainTypeFilter=lf.dataset.lf;document.querySelectorAll('[data-lf]').forEach(function(b){b.classList.toggle('active',b.dataset.lf===mainTypeFilter);});rebuildMainLog();}
@@ -874,6 +1094,7 @@ function rebuildDetailLog(){
 }
 
 function sendMainCmd(){
+  if(!IS_OWNER){return;}
   if(mainBotFilter==='all'){alert('Select a specific bot tab first.');return;}
   var inp=document.getElementById('main-cmd');if(!inp.value.trim())return;
   var cmd=inp.value.trim();inp.value='';
@@ -881,44 +1102,45 @@ function sendMainCmd(){
 }
 document.getElementById('main-cmd').addEventListener('keydown',function(e){if(e.key==='Enter')sendMainCmd();});
 
-// ── Detail modal ─────────────────────────────────────────────────────────
 function openDetail(name){
   detailBot=name;detailTypeFilter='all';
   document.querySelectorAll('[data-df]').forEach(function(b){b.classList.toggle('active',b.dataset.df==='all');});
   document.getElementById('detail-title').textContent='Bot: '+name;
   renderDetailLeft(name);rebuildDetailLog();
   openOverlay('detail-overlay');
-  setTimeout(function(){document.getElementById('detail-cmd-field').focus();},60);
+  if(IS_OWNER)setTimeout(function(){document.getElementById('detail-cmd-field').focus();},60);
 }
 function renderDetailLeft(name){
   var s=status[name]||{},st=stats[name]||{},cr=coords[name],cfg=botCfg[name]||{},srv=botSrv[name]||{};
   var si=botServerInfo[name]||serverInfo||{},proxy=cfg.proxy;
   var inv=st.inventory||{};
-  // Per-bot online duration
   var onlineStr='--';
   if(s.online&&s.onlineSince){var sec=Math.floor((Date.now()-s.onlineSince)/1000);onlineStr=sec<60?sec+'s':sec<3600?Math.floor(sec/60)+'m '+sec%60+'s':Math.floor(sec/3600)+'h '+Math.floor((sec%3600)/60)+'m';}
   var el=document.getElementById('detail-left');
+  var srvAddrDisplay=IS_OWNER?(esc(srv.host||'?')+':'+(srv.port||25565)):'<span class="redact">████████:█████</span>';
+  var srvMotdDisplay=IS_OWNER?(esc((si.motd||'').replace(/\u00a7[0-9a-fk-or]/gi,'')||srv.host||'?')):'[REDACTED]';
   el.innerHTML=
     '<div class="detail-srv-row">'+
       '<div class="detail-fav">'+(si.favicon?'<img src="'+si.favicon+'">':'&#127760;')+'</div>'+
       '<div style="flex:1;min-width:0">'+
-        '<div class="detail-srv-motd">'+esc((si.motd||'').replace(/\u00a7[0-9a-fk-or]/gi,'')||srv.host||'?')+'</div>'+
-        '<div class="detail-srv-addr">'+esc(srv.host||'?')+':'+(srv.port||25565)+'</div>'+
+        '<div class="detail-srv-motd">'+srvMotdDisplay+'</div>'+
+        '<div class="detail-srv-addr">'+srvAddrDisplay+'</div>'+
       '</div>'+
-      '<button style="background:none;border:1px solid var(--border);color:var(--dim);font-size:9px;padding:2px 6px;border-radius:4px;cursor:pointer;flex-shrink:0" id="detail-ping-btn">PING</button>'+
+      (IS_OWNER?'<button style="background:none;border:1px solid var(--border);color:var(--dim);font-size:9px;padding:2px 6px;border-radius:4px;cursor:pointer;flex-shrink:0" id="detail-ping-btn">PING</button>':'')+
     '</div>'+
     '<div class="detail-stat-grid">'+
-      '<div class="detail-stat"><div class="detail-stat-l">STATUS</div><div class="detail-stat-v" style="color:'+(!!s.online?'var(--green)':'var(--red)')+'">'+(!!s.online?'LIVE':'OFF')+'</div></div>'+
+      '<div class="detail-stat"><div class="detail-stat-l">STATUS</div><div class="detail-stat-v" style="color:'+(!!s.online?'var(--green)':'var(--red)')+'\">'+(!!s.online?'LIVE':'OFF')+'</div></div>'+
       '<div class="detail-stat"><div class="detail-stat-l">ONLINE FOR</div><div class="detail-stat-v" style="font-size:10px">'+onlineStr+'</div></div>'+
       '<div class="detail-stat"><div class="detail-stat-l">PLAYERS</div><div class="detail-stat-v">'+(si.onlinePlayers!=null?si.onlinePlayers+'/'+si.maxPlayers:'--')+'</div></div>'+
       '<div class="detail-stat"><div class="detail-stat-l">VERSION</div><div class="detail-stat-v" style="font-size:9px">'+esc(si.version||'--')+'</div></div>'+
     '</div>'+
     '<div class="detail-sec">COORDS</div>'+
-    '<div style="font-size:10px;color:var(--teal);padding:3px 0">'+(cr?'X:'+cr.x+' Y:'+cr.y+' Z:'+cr.z:'unknown')+'</div>'+
+    '<div style="font-size:10px;color:var(--teal);padding:3px 0">'+(IS_OWNER?(cr?'X:'+cr.x+' Y:'+cr.y+' Z:'+cr.z:'unknown'):'<span class="redact">X:0 Y:64 Z:0</span>')+'</div>'+
     '<div class="detail-sec">INVENTORY</div>'+
-    '<div style="font-size:10px;color:var(--dim2);padding:3px 0;line-height:1.8">'+(Object.keys(inv).length?Object.entries(inv).map(function(kv){return'<span style="color:var(--orange)">'+kv[1]+'</span> '+esc(kv[0].replace(/_/g,' '));}).join(' &bull; '):'empty')+'</div>'+
+    '<div style="font-size:10px;color:var(--dim2);padding:3px 0;line-height:1.8">'+(IS_OWNER?(Object.keys(inv).length?Object.entries(inv).map(function(kv){return'<span style="color:var(--orange)">'+kv[1]+'</span> '+esc(kv[0].replace(/_/g,' '));}).join(' &bull; '):'empty'):'<span class="redact">64x diamond 32x emerald</span>')+'</div>'+
     '<div class="detail-sec">PROXY</div>'+
-    '<div style="font-size:9px;color:'+(proxy?'var(--yellow)':'var(--dim)')+';padding:3px 0">'+(proxy?esc(proxy.host)+':'+proxy.port:'none')+'</div>'+
+    '<div style="font-size:9px;color:'+(IS_OWNER&&proxy?'var(--yellow)':'var(--dim)')+';padding:3px 0">'+(IS_OWNER?(proxy?esc(proxy.host)+':'+proxy.port:'none'):'hidden')+'</div>'+
+    (IS_OWNER?
     '<div class="detail-sec">ACTIONS</div>'+
     '<div style="display:flex;flex-direction:column;gap:5px;margin-top:2px">'+
       '<button class="modal-btn-sec" style="font-size:10px;padding:5px" data-daction="rename" data-dbot="'+esc(name)+'">&#9998; Rename</button>'+
@@ -926,42 +1148,39 @@ function renderDetailLeft(name){
       '<button class="modal-btn-sec" style="font-size:10px;padding:5px" data-daction="bsrv" data-dbot="'+esc(name)+'">&#127758; Bot Server</button>'+
       '<button class="modal-btn-sec" style="font-size:10px;padding:5px;color:var(--orange)" data-daction="inv" data-dbot="'+esc(name)+'">&#127974; Inventory</button>'+
       '<button class="modal-btn-sec" style="font-size:10px;padding:5px;color:var(--red)" data-daction="remove" data-dbot="'+esc(name)+'">&#10005; Remove</button>'+
-    '</div>';
-  // Wire ping button
-  var pb=document.getElementById('detail-ping-btn');
-  if(pb)pb.onclick=function(){pingBotServer(name);};
+    '</div>'
+    :'<div style="text-align:center;font-size:10px;color:var(--dim);margin-top:10px;padding:8px;border:1px dashed var(--border);border-radius:6px">👁 Visitor mode — actions hidden</div>');
+  if(IS_OWNER){var pb=document.getElementById('detail-ping-btn');if(pb)pb.onclick=function(){pingBotServer(name);};}
 }
 async function sendDetailCmd(){
-  if(!detailBot)return;
+  if(!IS_OWNER||!detailBot)return;
   var inp=document.getElementById('detail-cmd-field');if(!inp.value.trim())return;
   var cmd=inp.value.trim();inp.value='';
   await fetch('/bot/'+encodeURIComponent(detailBot)+'/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmd})});
 }
 
-// ── Inventory modal ───────────────────────────────────────────────────────
 function openInv(name){
+  if(!IS_OWNER)return;
   activeInv=name;
-  document.getElementById('inv-title').textContent='&#127974; '+name+' — Inventory & Containers';
+  document.getElementById('inv-title').textContent='&#127974; '+name+' \u2014 Inventory & Containers';
   renderInvBody(name);openOverlay('inv-overlay');
 }
 function renderInvBody(name){
   var st=stats[name]||{},inv=st.inventory||{};
   var cont=containers[name]||{items:{},ts:0};
   var body=document.getElementById('inv-body');body.innerHTML='';
-  // Inventory section
   var s1=document.createElement('div');s1.className='inv-sec-title';s1.textContent='HOTBAR / INVENTORY';body.appendChild(s1);
   var g1=document.createElement('div');g1.className='inv-grid';
   var invKeys=Object.keys(inv);
   if(invKeys.length)invKeys.forEach(function(k){var ch=document.createElement('div');ch.className='inv-chip';ch.innerHTML='<span class="inv-chip-name">'+esc(k.replace(/_/g,' '))+'</span><span class="inv-chip-count">x'+inv[k]+'</span>';g1.appendChild(ch);});
   else g1.innerHTML='<div class="inv-empty">No tracked items</div>';
   body.appendChild(g1);
-  // Containers section
-  var ts=cont.ts?(' — scanned '+ago(cont.ts)+' ago'):'';
+  var ts=cont.ts?(' \u2014 scanned '+ago(cont.ts)+' ago'):'';
   var s2=document.createElement('div');s2.className='inv-sec-title';s2.textContent='NEARBY CONTAINERS'+ts;body.appendChild(s2);
   var g2=document.createElement('div');g2.className='inv-grid';
   var contKeys=Object.keys(cont.items||{});
   if(contKeys.length)contKeys.forEach(function(k){var ch=document.createElement('div');ch.className='inv-chip';ch.innerHTML='<span class="inv-chip-name">'+esc(k.replace(/_/g,' '))+'</span><span class="inv-chip-count">x'+cont.items[k]+'</span>';g2.appendChild(ch);});
-  else g2.innerHTML='<div class="inv-empty">No data — press SCAN on the card first</div>';
+  else g2.innerHTML='<div class="inv-empty">No data \u2014 press SCAN on the card first</div>';
   body.appendChild(g2);
   var btn=document.createElement('button');btn.className='map-refresh';btn.style.marginTop='6px';
   btn.innerHTML='&#8635; Trigger Container Scan';
@@ -969,8 +1188,8 @@ function renderInvBody(name){
   body.appendChild(btn);
 }
 
-// ── Map modal ─────────────────────────────────────────────────────────────
 function openMap(name){
+  if(!IS_OWNER)return;
   activeMap=name;
   document.getElementById('map-title').textContent='Map \u2014 '+name;
   document.getElementById('map-answer').value='';document.getElementById('map-status').textContent='';
@@ -994,95 +1213,103 @@ async function submitMap(){
   else{st.textContent='Failed: '+(d.reason||'?');st.className='map-status err';}
 }
 
-// ── Add bot ───────────────────────────────────────────────────────────────
 function selectAddType(t){
   addType=t;
-  ['kill','afk','custom'].forEach(function(x){document.getElementById('add-type-'+x).className='type-opt '+x+(t===x?' selected':'');});
+  ['kill','afk','custom'].forEach(function(x){
+    var el=document.getElementById('add-type-'+x);
+    el.className='type-opt '+x+(t===x?' selected':'');
+  });
 }
+
 async function doAddBot(){
-  var name=document.getElementById('add-name').value.trim();
-  if(!name){alert('Enter a username');return;}
+  if(!IS_OWNER)return;
+  var n=document.getElementById('add-name').value.trim();
   var tag=document.getElementById('add-tag').value.trim();
   var host=document.getElementById('add-host').value.trim();
   var port=document.getElementById('add-port').value.trim();
-  var d=await fetch('/bot/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,type:addType,tag:tag,host:host||undefined,port:port||undefined})}).then(function(r){return r.json();});
-  if(d.ok){closeOverlay('add-overlay');['add-name','add-tag','add-host','add-port'].forEach(function(id){document.getElementById(id).value='';});}
-  else alert(d.reason||'Failed to add bot');
+  if(!n){alert('Name required');return;}
+  var d=await fetch('/bot/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n,type:addType,tag,host:host||undefined,port:port||undefined})}).then(r=>r.json());
+  if(d.ok){closeOverlay('add-overlay');document.getElementById('add-name').value='';document.getElementById('add-tag').value='';}
+  else alert(d.reason||'Failed');
 }
 
-// ── Proxy ─────────────────────────────────────────────────────────────────
 function openProxy(name){
-  activeProxy=name;document.getElementById('proxy-title').textContent='&#127760; Proxy \u2014 '+name;
+  if(!IS_OWNER)return;
+  activeProxy=name;document.getElementById('proxy-title').textContent='Proxy \u2014 '+name;
   var p=botCfg[name]&&botCfg[name].proxy;
-  document.getElementById('proxy-host').value=p&&p.host||'';
-  document.getElementById('proxy-port').value=p&&p.port||'1080';
-  document.getElementById('proxy-type').value=p&&p.type||'5';
-  document.getElementById('proxy-user').value=p&&p.username||'';
-  document.getElementById('proxy-pass').value=p&&p.password||'';
+  document.getElementById('proxy-host').value=p?p.host:'';
+  document.getElementById('proxy-port').value=p?p.port:'';
+  document.getElementById('proxy-type').value=p?String(p.type||5):'5';
+  document.getElementById('proxy-user').value=p&&p.username?p.username:'';
+  document.getElementById('proxy-pass').value=p&&p.password?p.password:'';
   openOverlay('proxy-overlay');
 }
 async function saveProxy(){
-  if(!activeProxy)return;
-  var d=await fetch('/bot/'+encodeURIComponent(activeProxy)+'/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:document.getElementById('proxy-host').value.trim(),port:document.getElementById('proxy-port').value,type:document.getElementById('proxy-type').value,username:document.getElementById('proxy-user').value,password:document.getElementById('proxy-pass').value})}).then(function(r){return r.json();});
-  if(d.ok){if(botCfg[activeProxy])botCfg[activeProxy].proxy=d.proxy;renderCard(activeProxy);closeOverlay('proxy-overlay');}
-  else alert(d.reason||'Failed');
+  if(!IS_OWNER||!activeProxy)return;
+  var host=document.getElementById('proxy-host').value.trim();
+  var port=document.getElementById('proxy-port').value.trim();
+  var type=document.getElementById('proxy-type').value;
+  var user=document.getElementById('proxy-user').value.trim();
+  var pass=document.getElementById('proxy-pass').value.trim();
+  var d=await fetch('/bot/'+encodeURIComponent(activeProxy)+'/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:host||null,port:port||null,type,username:user||null,password:pass||null})}).then(r=>r.json());
+  if(d.ok)closeOverlay('proxy-overlay');else alert('Failed');
 }
 async function clearProxy(){
-  if(!activeProxy)return;
-  var d=await fetch('/bot/'+encodeURIComponent(activeProxy)+'/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:''})}).then(function(r){return r.json();});
-  if(d.ok){if(botCfg[activeProxy])botCfg[activeProxy].proxy=null;renderCard(activeProxy);closeOverlay('proxy-overlay');}
+  if(!IS_OWNER||!activeProxy)return;
+  await fetch('/bot/'+encodeURIComponent(activeProxy)+'/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:null})});
+  closeOverlay('proxy-overlay');
 }
 
-// ── Per-bot server ────────────────────────────────────────────────────────
 function openBotServer(name){
-  activeBotSrv=name;document.getElementById('bsrv-title').textContent='&#127760; Server \u2014 '+name;
-  var srv=botSrv[name]||{};
-  document.getElementById('bsrv-host').value=srv.host||'';
-  document.getElementById('bsrv-port').value=srv.port||'25565';
+  if(!IS_OWNER)return;
+  activeBotSrv=name;document.getElementById('bsrv-title').textContent='Bot Server \u2014 '+name;
+  var s=botSrv[name]||{};
+  document.getElementById('bsrv-host').value=s.host||'';
+  document.getElementById('bsrv-port').value=s.port||'';
   openOverlay('bsrv-overlay');
 }
 async function saveBotServer(){
-  if(!activeBotSrv)return;
-  var d=await fetch('/bot/'+encodeURIComponent(activeBotSrv)+'/server',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:document.getElementById('bsrv-host').value.trim(),port:document.getElementById('bsrv-port').value})}).then(function(r){return r.json();});
-  if(d.ok){botSrv[activeBotSrv]=d.server;closeOverlay('bsrv-overlay');}
-  else alert('Failed');
+  if(!IS_OWNER||!activeBotSrv)return;
+  var host=document.getElementById('bsrv-host').value.trim();
+  var port=document.getElementById('bsrv-port').value.trim();
+  var d=await fetch('/bot/'+encodeURIComponent(activeBotSrv)+'/server',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:host||undefined,port:port||undefined})}).then(r=>r.json());
+  if(d.ok)closeOverlay('bsrv-overlay');else alert('Failed');
 }
 
-// ── Rename ────────────────────────────────────────────────────────────────
 function openRename(name){
+  if(!IS_OWNER)return;
   activeRename=name;document.getElementById('rename-input').value=name;
   openOverlay('rename-overlay');
   setTimeout(function(){var i=document.getElementById('rename-input');i.focus();i.select();},60);
 }
 async function doRename(){
-  if(!activeRename)return;
+  if(!IS_OWNER||!activeRename)return;
   var nn=document.getElementById('rename-input').value.trim();if(!nn)return;
   var oldName=activeRename;
   var d=await fetch('/bot/'+encodeURIComponent(oldName)+'/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({newName:nn})}).then(function(r){return r.json();});
-  if(d.ok){
-    // Migrate logs immediately so they aren't lost when botRenamed event fires
-    if(logs[oldName]&&!logs[nn]){logs[nn]=logs[oldName];}
-    activeRename=null;
-    closeOverlay('rename-overlay');
-  }else alert(d.reason||'Failed');
+  if(d.ok){if(logs[oldName]&&!logs[nn]){logs[nn]=logs[oldName];}activeRename=null;closeOverlay('rename-overlay');}
+  else alert(d.reason||'Failed');
 }
 
-// ── Remove ────────────────────────────────────────────────────────────────
 async function doRemove(name){
+  if(!IS_OWNER)return;
   var d=await fetch('/bot/'+encodeURIComponent(name)+'/remove',{method:'POST'}).then(function(r){return r.json();});
   if(!d.ok)alert(d.reason||'Failed');
 }
 
-// ── Global server ─────────────────────────────────────────────────────────
 async function saveServerConfig(){
+  if(!IS_OWNER)return;
   var host=document.getElementById('srv-host-input').value.trim(),port=document.getElementById('srv-port-input').value.trim();
   if(!host&&!port)return;
   var d=await fetch('/config/server',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:host||undefined,port:port||undefined})}).then(function(r){return r.json();});
   if(d.ok){updateSrvAddr(d.host,d.port);closeOverlay('srv-overlay');}else alert('Failed');
 }
-function updateSrvAddr(h,p){document.getElementById('srv-addr').textContent=(h||'?')+':'+(p||'?');}
+function updateSrvAddr(h,p){
+  if(IS_OWNER)document.getElementById('srv-addr').textContent=(h||'?')+':'+(p||'?');
+}
 
 async function pingBotServer(name){
+  if(!IS_OWNER)return;
   var srv=botSrv[name]||{};if(!srv.host)return;
   var pb=document.getElementById('detail-ping-btn');if(pb)pb.textContent='...';
   try{
@@ -1092,16 +1319,19 @@ async function pingBotServer(name){
   }catch(_){if(pb)pb.textContent='ERR';}
 }
 
-// Delegated handler for detail-left action buttons (safe for any bot name)
 document.addEventListener('click',function(ev){
   var el=ev.target.closest('[data-daction]');if(!el)return;
   var a=el.dataset.daction,n=el.dataset.dbot;
+  if(!IS_OWNER)return;
   if(a==='rename'){closeOverlay('detail-overlay');openRename(n);}
   else if(a==='proxy'){closeOverlay('detail-overlay');openProxy(n);}
   else if(a==='bsrv'){closeOverlay('detail-overlay');openBotServer(n);}
   else if(a==='inv'){openInv(n);}
   else if(a==='remove'){if(confirm('Remove '+n+'?')){doRemove(n);closeOverlay('detail-overlay');}}
 });
+
+async function pingServer(){
+  if(!IS_OWNER)return;
   document.getElementById('srv-motd').textContent='Pinging...';
   try{
     var d=await fetch('/serverinfo').then(function(r){return r.json();});
@@ -1114,8 +1344,10 @@ document.addEventListener('click',function(ev){
   }catch(_){document.getElementById('srv-motd').textContent='Ping failed';}
 }
 
-// ── Overlay helpers ───────────────────────────────────────────────────────
-function openOverlay(id){document.getElementById(id).classList.add('show');}
+function openOverlay(id){
+  if(!IS_OWNER&&['add-overlay','srv-overlay','proxy-overlay','rename-overlay','bsrv-overlay'].includes(id))return;
+  document.getElementById(id).classList.add('show');
+}
 function closeOverlay(id){
   document.getElementById(id).classList.remove('show');
   if(id==='detail-overlay')detailBot=null;
@@ -1126,10 +1358,10 @@ function closeOverlay(id){
   if(id==='inv-overlay')activeInv=null;
 }
 
-// ── Delegated card button events ──────────────────────────────────────────
 document.addEventListener('click',async function(ev){
   var el=ev.target.closest('[data-action]');if(!el)return;
   var a=el.dataset.action,b=el.dataset.bot;
+  if(!IS_OWNER)return;
   if(a==='start'||a==='stop'){
     if(status[b])status[b].running=(a==='start');renderCard(b);
     var d=await fetch('/bot/'+encodeURIComponent(b)+'/'+a,{method:'POST'}).then(function(r){return r.json();});
@@ -1144,7 +1376,6 @@ document.addEventListener('click',async function(ev){
   else if(a==='remove'){if(confirm('Remove bot '+b+'?'))doRemove(b);}
 });
 
-// ── Polling ───────────────────────────────────────────────────────────────
 async function poll(){
   var dot=document.getElementById('conn-dot'),txt=document.getElementById('conn-text');
   try{
@@ -1152,10 +1383,12 @@ async function poll(){
     lastId=d.lastId;dot.className='conn-dot live';txt.textContent='LIVE';
     if(!init){
       init=true;serverStart=d.state.serverStart;
-      var s=d.state.status,st=d.state.stats,cr=d.state.coords,bc=d.state.botConfigs,bs=d.state.botServers||{};
-      if(d.state.host)document.getElementById('srv-host-input').value=d.state.host;
-      if(d.state.port)document.getElementById('srv-port-input').value=d.state.port;
-      updateSrvAddr(d.state.host,d.state.port);
+      var s=d.state.status,st=d.state.stats||{},cr=d.state.coords||{},bc=d.state.botConfigs||{},bs=d.state.botServers||{};
+      if(IS_OWNER){
+        if(d.state.host)document.getElementById('srv-host-input').value=d.state.host;
+        if(d.state.port)document.getElementById('srv-port-input').value=d.state.port;
+        updateSrvAddr(d.state.host,d.state.port);
+      }
       var names=Object.keys(s);
       names.forEach(function(n){
         status[n]=s[n]||{};stats[n]=st[n]||{};coords[n]=cr[n]||null;
@@ -1165,10 +1398,10 @@ async function poll(){
         if(!logs[n])logs[n]=[];
         renderCard(n);
       });
-      if(!document.getElementById('add-card-btn')){
+      if(IS_OWNER&&!document.getElementById('add-card-btn')){
         var ac=document.createElement('div');ac.id='add-card-btn';ac.className='add-card';
         ac.onclick=function(){openOverlay('add-overlay');};
-        ac.innerHTML='<div class="add-icon">&#65291;</div><div class="add-label">ADD BOT</div>';
+        ac.innerHTML='<div class="add-icon">&#65291;</div><div class="add-label">ADD BOTS</div>';
         document.getElementById('cards').appendChild(ac);
       }
       updateBotTabs();
@@ -1178,74 +1411,56 @@ async function poll(){
       if(e==='log'){
         if(!logs[dat.username])logs[dat.username]=[];
         logs[dat.username].push(dat);
-        pushMainLog(dat);
-        pushDetailLog(dat);
+        pushMainLog(dat);pushDetailLog(dat);
       }else if(e==='status'){
-        if(status[dat.username]){
-          status[dat.username].online=dat.online;
-          if(dat.online)status[dat.username].onlineSince=dat.onlineSince||Date.now();
-          else status[dat.username].onlineSince=null;
-        }
-        renderCard(dat.username);
-        if(detailBot===dat.username)renderDetailLeft(dat.username);
+        if(status[dat.username]){status[dat.username].online=dat.online;if(dat.online)status[dat.username].onlineSince=dat.onlineSince||Date.now();else status[dat.username].onlineSince=null;}
+        renderCard(dat.username);if(detailBot===dat.username)renderDetailLeft(dat.username);
       }else if(e==='stats'){
         if(stats[dat.username])stats[dat.username]=Object.assign({},stats[dat.username],dat.stats);
-        renderCard(dat.username);
-        if(detailBot===dat.username)renderDetailLeft(dat.username);
-        if(activeInv===dat.username)renderInvBody(dat.username);
+        renderCard(dat.username);if(detailBot===dat.username)renderDetailLeft(dat.username);if(activeInv===dat.username)renderInvBody(dat.username);
       }else if(e==='coords'){
-        coords[dat.username]=dat.coords;renderCard(dat.username);
-        if(detailBot===dat.username)renderDetailLeft(dat.username);
+        coords[dat.username]=dat.coords;renderCard(dat.username);if(detailBot===dat.username)renderDetailLeft(dat.username);
       }else if(e==='containerUpdate'){
-        // Replace entirely — prevents item count duplication on repeated scans
-        containers[dat.username]=dat.data;
-        if(activeInv===dat.username)renderInvBody(dat.username);
+        containers[dat.username]=dat.data;if(activeInv===dat.username)renderInvBody(dat.username);
       }else if(e==='control'){
-        if(status[dat.username])status[dat.username].running=dat.running!=null?dat.running:(dat.action==='started');
-        renderCard(dat.username);
+        if(status[dat.username])status[dat.username].running=dat.running!=null?dat.running:(dat.action==='started');renderCard(dat.username);
       }else if(e==='serverInfo'){
         serverInfo=dat;
-        if(dat.motd)document.getElementById('srv-motd').textContent=dat.motd.replace(/\u00a7[0-9a-fk-or]/gi,'')||'(no motd)';
-        if(dat.onlinePlayers!=null)document.getElementById('srv-players').textContent=dat.onlinePlayers+'/'+dat.maxPlayers+' online';
-        if(dat.version)document.getElementById('srv-ver').textContent=dat.version;
-        if(dat.favicon&&dat.favicon.startsWith('data:image'))document.getElementById('srv-fav').innerHTML='<img src="'+dat.favicon+'">';
+        if(IS_OWNER){
+          if(dat.motd)document.getElementById('srv-motd').textContent=dat.motd.replace(/\u00a7[0-9a-fk-or]/gi,'')||'(no motd)';
+          if(dat.onlinePlayers!=null)document.getElementById('srv-players').textContent=dat.onlinePlayers+'/'+dat.maxPlayers+' online';
+          if(dat.version)document.getElementById('srv-ver').textContent=dat.version;
+          if(dat.favicon&&dat.favicon.startsWith('data:image'))document.getElementById('srv-fav').innerHTML='<img src="'+dat.favicon+'">';
+        }
         if(detailBot)renderDetailLeft(detailBot);
-      }else if(e==='serverConfig'){updateSrvAddr(dat.host,dat.port);}
+      }else if(e==='serverConfig'){if(IS_OWNER)updateSrvAddr(dat.host,dat.port);}
       else if(e==='botServerUpdated'){botSrv[dat.name]=dat.server;}
       else if(e==='botAdded'){
         status[dat.name]=dat.status;stats[dat.name]={ghastKills:0,foodAte:0,inventory:{},chests:{}};
         coords[dat.name]=null;containers[dat.name]={items:{},ts:0};logs[dat.name]=[];
-        if(dat.config)botCfg[dat.name]=dat.config;
-        if(dat.server)botSrv[dat.name]=dat.server;
+        if(dat.config)botCfg[dat.name]=dat.config;if(dat.server)botSrv[dat.name]=dat.server;
         renderCard(dat.name);updateBotTabs();
       }else if(e==='botRemoved'){
         delete status[dat.name];delete stats[dat.name];delete coords[dat.name];
         delete botCfg[dat.name];delete botSrv[dat.name];delete containers[dat.name];delete logs[dat.name];
         var c=document.getElementById('bc-'+dat.name);if(c)c.remove();
         updateBotTabs();
-        if(detailBot===dat.name)closeOverlay('detail-overlay');
-        if(activeInv===dat.name)closeOverlay('inv-overlay');
+        if(detailBot===dat.name)closeOverlay('detail-overlay');if(activeInv===dat.name)closeOverlay('inv-overlay');
       }else if(e==='botRenamed'){
         var oN=dat.oldName,nN=dat.newName;
-        // Migrate allLogs username references live
         allLogs.forEach(function(entry){if(entry.username===oN)entry.username=nN;});
-        // Migrate per-bot logs
         if(logs[oN]){logs[nN]=logs[oN];delete logs[oN];}
         delete status[oN];delete stats[oN];delete coords[oN];delete botCfg[oN];delete botSrv[oN];delete containers[oN];
         var oc=document.getElementById('bc-'+oN);if(oc)oc.remove();
         status[nN]=dat.status;
         if(!stats[nN])stats[nN]={ghastKills:0,foodAte:0,inventory:{},chests:{}};
-        if(!coords[nN])coords[nN]=null;
-        if(!containers[nN])containers[nN]={items:{},ts:0};
-        if(dat.config)botCfg[nN]=dat.config;
-        if(dat.server)botSrv[nN]=dat.server;
-        // Keep watching the renamed bot in log if we were watching old name
+        if(!coords[nN])coords[nN]=null;if(!containers[nN])containers[nN]={items:{},ts:0};
+        if(dat.config)botCfg[nN]=dat.config;if(dat.server)botSrv[nN]=dat.server;
         if(mainBotFilter===oN){mainBotFilter=nN;}
         renderCard(nN);updateBotTabs();rebuildMainLog();
         if(detailBot===oN){detailBot=nN;document.getElementById('detail-title').textContent='Bot: '+nN;renderDetailLeft(nN);}
       }else if(e==='proxyUpdated'){
-        if(botCfg[dat.name])botCfg[dat.name].proxy=dat.proxy;renderCard(dat.name);
-        if(detailBot===dat.name)renderDetailLeft(dat.name);
+        if(botCfg[dat.name])botCfg[dat.name].proxy=dat.proxy;renderCard(dat.name);if(detailBot===dat.name)renderDetailLeft(dat.name);
       }
     });
   }catch(_){
@@ -1278,7 +1493,7 @@ function startPoll(){if(pollTimer)clearTimeout(pollTimer);init=false;lastId=0;po
   draw();
 })();
 
-startPoll();pingServer();setInterval(pingServer,5*60*1000);
+startPoll();
 </script>
 </body>
 </html>`; }
@@ -1294,6 +1509,6 @@ app.listen(PORT_WEB, '0.0.0.0', () => {
       else console.log('[Server] ping failed');
     }).catch(() => {});
   }, 3000);
-  setTimeout(() => { botStatus[BOT1].running = true; console.log('[Launcher] Starting Kill bot: ' + BOT1); launchBot(BOT1); }, 2000);
-  setTimeout(() => { botStatus[BOT2].running = true; console.log('[Launcher] Starting AFK bot: ' + BOT2); launchBot(BOT2); }, 22000);
+  setTimeout(() => { botStatus[BOT1].running = true; console.log('[Launcher] Starting Kill bots: ' + BOT1); launchBot(BOT1); }, 2000);
+  setTimeout(() => { botStatus[BOT2].running = true; console.log('[Launcher] Starting AFK bots: ' + BOT2); launchBot(BOT2); }, 22000);
 });
