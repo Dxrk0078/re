@@ -673,6 +673,29 @@ app.post('/api/whitelist/remove', (req, res) => {
   res.json({ ok: true, ip });
 });
 
+// ─── Blacklist API ────────────────────────────────────────────────────────────
+app.get('/api/blacklist', (req, res) => {
+  if (!isWhitelisted(req)) return res.status(403).json({ error: 'forbidden' });
+  res.json({ ips: [...blacklist] });
+});
+app.post('/api/blacklist/add', (req, res) => {
+  if (!isWhitelisted(req)) return res.status(403).json({ error: 'forbidden' });
+  const { ip } = req.body;
+  if (!ip) return res.status(400).json({ error: 'ip required' });
+  blacklist.add(ip);
+  whitelist.delete(ip); // remove from whitelist if present
+  broadcast('blacklistUpdate', { action: 'add', ip });
+  res.json({ ok: true, ip });
+});
+app.post('/api/blacklist/remove', (req, res) => {
+  if (!isWhitelisted(req)) return res.status(403).json({ error: 'forbidden' });
+  const { ip } = req.body;
+  if (!ip) return res.status(400).json({ error: 'ip required' });
+  blacklist.delete(ip);
+  broadcast('blacklistUpdate', { action: 'remove', ip });
+  res.json({ ok: true, ip });
+});
+
 // ─── Bot launcher ─────────────────────────────────────────────────────────────
 function launchBot(name) {
   const cfg = botConfigs[name];
@@ -2019,15 +2042,13 @@ async function saveServerConfig(){
 }
 
 async function loadWlBl(){
-  try{
-    var wl=await fetch('/api/whitelist').then(r=>r.json());
-    var bl=await fetch('/api/blacklist').then(r=>r.json());
-    var myip=await fetch('/api/whoami').then(r=>r.json());
-    var mid=document.getElementById('my-ip-display');
-    if(mid)mid.textContent=myip.ip||'unknown';
-    renderWlList(wl.ips||[]);
-    renderBlList(bl.ips||[]);
-  }catch(_){}
+  var wl=await fetch('/api/whitelist').then(function(r){return r.json();}).catch(function(){return{ips:[]};});
+  var bl=await fetch('/api/blacklist').then(function(r){return r.json();}).catch(function(){return{ips:[]};});
+  var myip=await fetch('/api/whoami').then(function(r){return r.json();}).catch(function(){return{ip:'unknown'};});
+  var mid=document.getElementById('my-ip-display');
+  if(mid)mid.textContent=myip.ip||'unknown';
+  renderWlList(wl.ips||[]);
+  renderBlList(bl.ips||[]);
 }
 function renderWlList(ips){
   var el=document.getElementById('wl-list');if(!el)return;
