@@ -1,12 +1,13 @@
 require('dotenv').config();
 const express = require('express');
+const crypto  = require('crypto');
 
 const SERVER_START = Date.now();
 const app = express();
 const PORT_WEB = process.env.PORT || 3000;
 
 // ─── Trust Railway / Railway.app reverse proxy ──────────────────────────────
-app.set('trust proxy', 1);
+app.set('trust proxy', true); // fix: multi-hop platforms need 'true' not 1
 app.use(express.json());
 
 const utils = require('./utils');
@@ -36,7 +37,9 @@ whitelist.add('::1');
 whitelist.add('::ffff:127.0.0.1');
 
 function getClientIP(req) {
-  return req.ip || req.connection.remoteAddress || '0.0.0.0';
+  const fwd = req.headers['x-forwarded-for'];
+  if (fwd) { const first = fwd.split(',')[0].trim(); if (first) return first; }
+  return req.ip || req.socket?.remoteAddress || req.connection?.remoteAddress || '0.0.0.0';
 }
 
 function isBlacklisted(req) {
@@ -45,12 +48,86 @@ function isBlacklisted(req) {
   return blacklist.has(ip) || blacklist.has(raw);
 }
 
+function isSessionWhitelisted(ip) {
+  const raw = ip.replace(/^::ffff:/, '');
+  for (const k of [ip, raw]) {
+    const exp = sessionWhitelist.get(k);
+    if (exp != null) { if (Date.now() < exp) return true; sessionWhitelist.delete(k); }
+  }
+  return false;
+}
+
 function isWhitelisted(req) {
   const ip = getClientIP(req);
   if (whitelist.has(ip)) return true;
-  // Also check raw IPv4 from IPv6-mapped
   const raw = ip.replace(/^::ffff:/, '');
-  return whitelist.has(raw);
+  if (whitelist.has(raw)) return true;
+  return isSessionWhitelisted(ip);
+}
+
+// ─── Session Keys ─────────────────────────────────────────────────────────────
+const sessionKeys      = new Map();
+const sessionWhitelist = new Map();
+
+function parseDuration(str) {
+  if (!str) return null;
+  const m = String(str).match(/^(\d+)(s|m|h|d)$/i);
+  if (!m) return null;
+  return parseInt(m[1]) * { s: 1000, m: 60000, h: 3600000, d: 86400000 }[m[2].toLowerCase()];
+}
+
+function formatDuration(ms) {
+  if (ms < 60000)   return Math.round(ms / 1000) + 's';
+  if (ms < 3600000) return Math.round(ms / 60000) + 'm';
+  return Math.round(ms / 3600000) + 'h';
+}
+
+function parseProxy(str) {
+  if (!str) return null;
+  str = str.trim();
+  try {
+    if (/^(socks[45]?|http):\/\//i.test(str)) {
+      const u = new URL(str);
+      return { type: /^http/i.test(u.protocol) ? 'http' : (/socks4/i.test(u.protocol) ? 4 : 5),
+               host: u.hostname, port: parseInt(u.port) || 1080,
+               username: u.username || undefined, password: u.password || undefined };
+    }
+    const p = str.split(':');
+    if (p.length >= 2) return { type: 5, host: p[0], port: parseInt(p[1]) || 1080, username: p[2], password: p[3] };
+  } catch(_) {}
+  return null;
+}
+
+function createSessionKey(durationMs, label = '') {
+  const key = crypto.randomBytes(12).toString('hex');
+  sessionKeys.set(key, { expiresAt: Date.now() + durationMs, label, used: false });
+  setTimeout(() => sessionKeys.delete(key), durationMs + 5000);
+  return key;
+}
+
+function redeemSessionKey(key, ip) {
+  const sess = sessionKeys.get(key);
+  if (!sess) return { ok: false, reason: 'Invalid or expired key' };
+  if (Date.now() > sess.expiresAt) { sessionKeys.delete(key); return { ok: false, reason: 'Key expired' }; }
+  if (sess.used) return { ok: false, reason: 'Key already used' };
+  sess.used = true;
+  const remaining = sess.expiresAt - Date.now();
+  sessionWhitelist.set(ip, Date.now() + remaining);
+  const raw = ip.replace(/^::ffff:/, '');
+  if (raw !== ip) sessionWhitelist.set(raw, Date.now() + remaining);
+  setTimeout(() => { sessionWhitelist.delete(ip); sessionWhitelist.delete(raw); }, remaining + 1000);
+  return { ok: true, remaining };
+}
+
+// ─── VIP Session ──────────────────────────────────────────────────────────────
+const vipSession = { active: false, bots: [], count: 0, expiresAt: null, proxies: [], timer: null };
+
+function stopVipSession() {
+  if (vipSession.timer) clearTimeout(vipSession.timer);
+  vipSession.bots.forEach(b => { try { b.destroy(); } catch(_){} });
+  vipSession.bots = []; vipSession.active = false; vipSession.count = 0;
+  vipSession.expiresAt = null; vipSession.timer = null; vipSession.proxies = [];
+  console.log('[VIP] Session stopped');
 }
 
 // ─── Discord Bot ──────────────────────────────────────────────────────────────
@@ -335,13 +412,102 @@ if (DISCORD_TOKEN) {
       const reply = (embed) => msg.reply({ embeds: [embed] });
       if (cmd === 'help') {
         await reply(mkEmbed('🤖 MC-BOTS Commands', [
-          '`/bots` — Bot panel with buttons',
-          '`/status` — All bot statuses',
-          '`/bot <name> <action>` — Control bot',
-          '`/whitelist <add|remove|list|clear>`',
-          '`/blacklist <add|remove|list>`',
-          '`/uptime` — Server uptime',
+          '**Slash Commands**',
+          '`/bots` `/status` `/bot` `/whitelist` `/blacklist` `/uptime`',
+          '',
+          '**🔑 Session Keys**',
+          '`!key <duration>` — One-time timed dashboard link',
+          '_e.g. `!key 30s`  `!key 30m`  `!key 1h`_',
+          '',
+          '**🤖 VIP Bot Swarm** _(connect-only, ultra-light)_',
+          '`!vip <count> <duration> [proxy1 proxy2 ...]`',
+          '_e.g. `!vip 10 30m 1.2.3.4:1080`_',
+          '`!vipstop` — Stop VIP session early',
+          '`!vpncheck <proxy ...>` — Test proxy/VPN connectivity',
         ].join('\n')));
+
+      // !key
+      } else if (cmd === 'key') {
+        const ms = parseDuration(args[1]);
+        if (!ms) return reply(mkEmbed('❌ Bad Duration', 'Usage: `!key <time>`  e.g. `!key 30s` `!key 30m` `!key 1h`', RED));
+        if (ms > 86400000) return reply(mkEmbed('❌ Too Long', 'Max is **24h**.', RED));
+        const key  = createSessionKey(ms, `by ${msg.author.tag}`);
+        const base = (process.env.PUBLIC_URL || `http://localhost:${PORT_WEB}`).replace(/\/$/,'');
+        const url  = `${base}/auth?key=${key}`;
+        await reply(mkEmbed('🔑 Session Key Created', [
+          `**Duration:** ${formatDuration(ms)}`,
+          `**Expires:** <t:${Math.floor((Date.now() + ms) / 1000)}:R>`,
+          '',
+          '**One-time link — share with the person who needs access:**',
+          `\`\`\`${url}\`\`\``,
+          '_Single-use. Grants their IP full dashboard access for the duration._',
+        ].join('\n'), GREEN));
+
+      // !vip
+      } else if (cmd === 'vip') {
+        if (vipSession.active) return reply(mkEmbed('⚠️ Already Active',
+          `Running **${vipSession.bots.length}** VIP bots. Use \`!vipstop\` first.`, YELLOW));
+        const count = parseInt(args[1]);
+        const ms    = parseDuration(args[2]);
+        if (!count || count < 1 || !ms) return reply(mkEmbed('❌ Usage',
+          '`!vip <count> <duration> [proxy1 proxy2 ...]`', RED));
+        if (count > 200) return reply(mkEmbed('❌ Too Many', 'Max **200** VIP bots.', RED));
+        const proxies = args.slice(3).filter(Boolean).map(parseProxy).filter(Boolean);
+        await reply(mkEmbed('⏳ Launching…',
+          `Starting **${count}** ultra-light bots${proxies.length ? ` via **${proxies.length}** proxy/VPN` : ' (direct)'}…`, YELLOW));
+        try {
+          const vipBot = require('./vip-bot');
+          vipSession.active = true; vipSession.count = count;
+          vipSession.proxies = proxies; vipSession.expiresAt = Date.now() + ms;
+          const launched = await vipBot.launchSwarm({
+            count, proxies, host: utils.HOST, port: utils.MC_PORT,
+            password: process.env.PASSWORD || 'botx123x',
+            onDead: (u) => { const i = vipSession.bots.findIndex(b => b.username === u); if (i !== -1) vipSession.bots.splice(i, 1); },
+          });
+          vipSession.bots  = launched;
+          vipSession.timer = setTimeout(() => {
+            stopVipSession();
+            if (DISCORD_CHANNEL_ID && discordClient) {
+              discordClient.channels.fetch(DISCORD_CHANNEL_ID)
+                .then(ch => ch.send({ embeds: [mkEmbed('⏰ VIP Expired', 'All VIP bots disconnected.', YELLOW)] })).catch(()=>{});
+            }
+          }, ms);
+          const proxyLines = proxies.length
+            ? proxies.map((p, i) => `\`${p.host}:${p.port}\` → **${launched.filter(b => b.proxyIndex === i).length}** bots`).join('\n')
+            : '_Direct (no proxy)_';
+          await msg.reply({ embeds: [mkEmbed('✅ VIP Swarm Active', [
+            `**Connected:** ${launched.length}/${count}`,
+            `**Duration:** ${formatDuration(ms)} (ends <t:${Math.floor(vipSession.expiresAt / 1000)}:R>)`,
+            proxies.length ? `\n**Proxy Distribution:**\n${proxyLines}` : '',
+            '\nUse `!vipstop` to end early.',
+          ].join('\n'), GREEN)] });
+        } catch(e) {
+          vipSession.active = false;
+          await msg.reply({ embeds: [mkEmbed('❌ Launch Failed', String(e.message), RED)] });
+        }
+
+      // !vipstop
+      } else if (cmd === 'vipstop') {
+        if (!vipSession.active) return reply(mkEmbed('ℹ️ No Session', 'No VIP bot session is running.', YELLOW));
+        const n = vipSession.bots.length; stopVipSession();
+        await reply(mkEmbed('🛑 VIP Stopped', `Disconnected **${n}** bots.`, RED));
+
+      // !vpncheck
+      } else if (cmd === 'vpncheck') {
+        const rawList = args.slice(1).filter(Boolean);
+        if (!rawList.length) return reply(mkEmbed('❌ Usage',
+          '`!vpncheck <proxy1> [proxy2 ...]`\nFormats: `host:port`  `socks5://user:pass@host:port`  `http://host:port`', RED));
+        await reply(mkEmbed('🔍 Testing…', `Checking **${rawList.length}** proxy/VPN${rawList.length > 1 ? 's' : ''}…`, YELLOW));
+        const vipBot = require('./vip-bot');
+        const results = await Promise.all(rawList.map(async raw => {
+          const proxy = parseProxy(raw);
+          if (!proxy) return `❓ \`${raw}\` — unrecognised format`;
+          const res = await vipBot.checkProxy(proxy);
+          const label = proxy.type === 'http' ? 'HTTP' : 'SOCKS5';
+          return res.ok ? `✅ \`${proxy.host}:${proxy.port}\` (${label}) — **online** ${res.latency}ms`
+                        : `❌ \`${proxy.host}:${proxy.port}\` (${label}) — ${res.err}`;
+        }));
+        await msg.reply({ embeds: [mkEmbed('📡 Proxy Results', results.join('\n'), PURPLE)] });
       }
     });
 
@@ -418,6 +584,25 @@ function broadcast(event, data) {
     if (eventQueue.length > 500) eventQueue.shift();
   }
 }
+
+// ─── Session Key Redemption ───────────────────────────────────────────────────
+app.get('/auth', (req, res) => {
+  const key = req.query.key;
+  const ip  = getClientIP(req);
+  if (!key) return res.redirect('/dash');
+  const result = redeemSessionKey(key, ip);
+  if (!result.ok) {
+    return res.send(`<html><body style="background:#050210;color:#e8deff;font-family:monospace;padding:40px;text-align:center">
+      <h2 style="color:#f87171">⛔ Access Denied</h2><p style="font-size:18px;color:#c4b5fd">${result.reason}</p>
+      <p style="color:#7a6699;font-size:13px">Contact the admin on Discord for a new key.</p></body></html>`);
+  }
+  console.log(`[Session] Key redeemed by ${ip} — ${formatDuration(result.remaining)} access granted`);
+  return res.send(`<html><head><meta http-equiv="refresh" content="1;url=/dash"></head>
+    <body style="background:#050210;color:#e8deff;font-family:monospace;padding:40px;text-align:center">
+      <h2 style="color:#34d399">✅ Access Granted</h2>
+      <p style="font-size:18px;color:#c4b5fd">Session active for <strong>${formatDuration(result.remaining)}</strong></p>
+      <p style="color:#7a6699;font-size:13px">Redirecting to dashboard…</p></body></html>`);
+});
 
 // SSE — only whitelisted IPs can subscribe
 app.get('/events', (req, res) => {
