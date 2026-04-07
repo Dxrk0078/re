@@ -1,3 +1,7 @@
+// ─── Global crash handler — logs real error before Railway kills the process ──
+process.on('uncaughtException',  (err) => { console.error('[CRASH] uncaughtException:', err.stack || err); process.exit(1); });
+process.on('unhandledRejection', (err) => { console.error('[CRASH] unhandledRejection:', err?.stack || err); process.exit(1); });
+
 require('dotenv').config();
 const express = require('express');
 const crypto  = require('crypto');
